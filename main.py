@@ -9,7 +9,7 @@ from discord.ext import commands
 api_id = 
 api_hash = ''
 telegram_client = TelegramClient('', api_id, api_hash)
-telegram_channel = ''
+telegram_channel = '' # Ví dụ: https://t.me/douban_read
 
 discord_token = ''
 discord_thread_id = ''
@@ -69,10 +69,8 @@ async def download_and_send_messages(thread):
             file_name = attributes[0].file_name if len(attributes) == 1 else attributes[1].file_name
             print(f"Đang tải tệp: {file_name}")
             try:
-                await asyncio.wait_for(telegram_client.download_media(file, f"./telegram/{file_name}"), timeout=120)
+                await telegram_client.download_media(file, f"./telegram/{file_name}")
                 await send_file_to_discord(f"./telegram/{file_name}", thread)
-            except asyncio.TimeoutError:
-                print(f"Đã hết thời gian chờ khi tải file: {file_name}")
             except Exception as e:
                 print(f"Đã xảy ra lỗi khi tải về file: {file_name}: {e}")
         
@@ -83,7 +81,7 @@ async def download_and_send_messages(thread):
             filename = f"./telegram/{video.id}.mp4"
             print(f"Đang tải về: {index} / {total_videos} videos | Tên tệp: {filename}")
             try:
-                await asyncio.wait_for(telegram_client.download_media(video, filename))
+                await telegram_client.download_media(video, filename)
                 if os.path.getsize(filename) > 100 * 512 * 512:
                     parts = split_video(filename)
                     for part in parts:
@@ -91,8 +89,6 @@ async def download_and_send_messages(thread):
                         os.remove(part)
                 else:
                     await send_file_to_discord(filename, thread)
-            except asyncio.TimeoutError:
-                print(f"Đã quá thời gian chờ để tải về file: {filename}")
             except Exception as e:
                 print(f"Đã xảy ra lỗi khi tải: {filename}: {e}")
 
@@ -102,10 +98,8 @@ async def on_ready():
     thread = bot.get_channel(int(discord_thread_id))
     if thread is None:
         print(f'Không thể tìm thấy chủ đề với ID: {discord_thread_id} trên Discord!')
-        break
     else:
         await download_and_send_messages(thread)
-        break
 
 if not os.path.exists('./telegram/'):
     os.makedirs('./telegram/')
