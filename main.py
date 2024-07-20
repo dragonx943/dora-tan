@@ -9,7 +9,7 @@ from discord.ext import commands
 api_id = 
 api_hash = ''
 telegram_client = TelegramClient('', api_id, api_hash)
-telegram_channel = '' # Ví dụ: https://t.me/douban_read
+telegram_channel = ''
 
 discord_token = ''
 discord_thread_id = ''
@@ -110,5 +110,4 @@ async def on_ready():
 if not os.path.exists('./telegram/'):
     os.makedirs('./telegram/')
 
-# Run the Discord bot
 bot.run(discord_token)
