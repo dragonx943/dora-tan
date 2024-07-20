@@ -1,0 +1,7 @@
+telethon
+bs4
+requests
+lxml
+asyncio
+pycord
+moviepy
