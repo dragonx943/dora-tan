@@ -1,15 +1,17 @@
 import asyncio
 import os
 from telethon import TelegramClient, utils
+from telethon.errors import TimeoutError
 from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterDocument, InputMessagesFilterVideo
 import discord
-import moviepy
 from discord.ext import commands
+from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
+from moviepy.video.io.VideoFileClip import VideoFileClip
 
 api_id = 
 api_hash = ''
 telegram_client = TelegramClient('', api_id, api_hash)
-telegram_channel = '' # Ví dụ: https://t.me/douban_read
+telegram_channel = ''
 
 discord_token = ''
 discord_thread_id = ''
@@ -21,35 +23,40 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 async def send_file_to_discord(file_path, thread):
     await thread.send(file=discord.File(file_path))
 
-def split_video(file_path, max_size_mb=50):
-    from moviepy.video.io.VideoFileClip import VideoFileClip
-
+def split_video(file_path, segment_duration=120):
     video = VideoFileClip(file_path)
     total_duration = int(video.duration)
-    max_size_bytes = max_size_mb * 512 * 512
     current_start = 0
     parts = []
     part_index = 0
 
     while current_start < total_duration:
-        current_end = total_duration
+        current_end = min(total_duration, current_start + segment_duration)
         part_path = f"{file_path}_part{part_index}.mp4"
 
-        while current_end > current_start:
+        try:
             ffmpeg_extract_subclip(file_path, current_start, current_end, targetname=part_path)
-            if os.path.getsize(part_path) <= max_size_bytes:
-                parts.append(part_path)
-                current_start = current_end
-                part_index += 1
-                break
-            else:
-                current_end -= 10
-
-        if current_end <= current_start:
-            print("Đã xảy ra lỗi khi chia nhỏ file Video từ Telegram!")
+            parts.append(part_path)
+            print(f"Đang chia thành đoạn thứ {part_index} từ phân cảnh {current_start} đến {current_end}...")
+            current_start = current_end
+            part_index += 1
+        except Exception as e:
+            print(f"Đã xảy ra sự cố khi tách file video dài: {e}")
             break
 
+    video.close()
     return parts
+
+async def download_file(media, filename, retries=5):
+    for attempt in range(retries):
+        try:
+            await telegram_client.download_media(media, filename)
+            return filename
+        except TimeoutError:
+            print(f"Lỗi timeout: Đang thử lại lần thứ {attempt + 1}/{retries}")
+            if attempt + 1 == retries:
+                raise
+            await asyncio.sleep(5)
 
 async def download_and_send_messages(thread):
     async with telegram_client:
@@ -59,7 +66,7 @@ async def download_and_send_messages(thread):
         for index, photo in enumerate(photos, start=1):
             filename = f"./telegram/{photo.id}.jpg"
             print(f"Đang tải: {index} / {total_photos} ảnh | Tên tệp: {filename}")
-            await telegram_client.download_media(photo, filename)
+            await download_file(photo, filename)
             await send_file_to_discord(filename, thread)
           
         print('=== Bắt đầu tải file phương tiện từ Telegram! ===')
@@ -69,7 +76,7 @@ async def download_and_send_messages(thread):
             file_name = attributes[0].file_name if len(attributes) == 1 else attributes[1].file_name
             print(f"Đang tải tệp: {file_name}")
             try:
-                await telegram_client.download_media(file, f"./telegram/{file_name}")
+                await download_file(file, f"./telegram/{file_name}")
                 await send_file_to_discord(f"./telegram/{file_name}", thread)
             except Exception as e:
                 print(f"Đã xảy ra lỗi khi tải về file: {file_name}: {e}")
@@ -81,8 +88,8 @@ async def download_and_send_messages(thread):
             filename = f"./telegram/{video.id}.mp4"
             print(f"Đang tải về: {index} / {total_videos} videos | Tên tệp: {filename}")
             try:
-                await telegram_client.download_media(video, filename)
-                if os.path.getsize(filename) > 100 * 512 * 512:
+                await download_file(video, filename)
+                if os.path.getsize(filename) > 50 * 1024 * 1024:
                     parts = split_video(filename)
                     for part in parts:
                         await send_file_to_discord(part, thread)
