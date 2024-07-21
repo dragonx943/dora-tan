@@ -4,4 +4,7 @@ requests
 lxml
 asyncio
 pycord
+py-cord
 moviepy
+datetime
+pytz
