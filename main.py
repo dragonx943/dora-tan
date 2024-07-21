@@ -1,24 +1,33 @@
 import asyncio
 import os
-from telethon import TelegramClient, utils
-from telethon.errors import TimeoutError
+import shutil
+import logging
+from telethon import TelegramClient, functions
+from telethon.errors import TimeoutError, InviteHashExpiredError, ChannelPrivateError, ChatAdminRequiredError, InviteHashInvalidError
 from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterDocument, InputMessagesFilterVideo
+from telethon.tl.functions.messages import ImportChatInviteRequest
 import discord
 from discord.ext import commands
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 from moviepy.video.io.VideoFileClip import VideoFileClip
+import datetime
+import pytz
 
 api_id = 
 api_hash = ''
 telegram_client = TelegramClient('', api_id, api_hash)
-telegram_channel = ''
 
 discord_token = ''
-discord_thread_id = ''
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="(%(asctime)s) [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
 
 async def send_file_to_discord(file_path, thread):
     await thread.send(file=discord.File(file_path))
@@ -37,11 +46,11 @@ def split_video(file_path, segment_duration=120):
         try:
             ffmpeg_extract_subclip(file_path, current_start, current_end, targetname=part_path)
             parts.append(part_path)
-            print(f"Đang chia thành đoạn thứ {part_index} từ phân cảnh {current_start} đến {current_end}...")
+            print(f"Split part {part_index} from {current_start} to {current_end}")
             current_start = current_end
             part_index += 1
         except Exception as e:
-            print(f"Đã xảy ra sự cố khi tách file video dài: {e}")
+            print(f"Exception during splitting: {e}")
             break
 
     video.close()
@@ -53,12 +62,35 @@ async def download_file(media, filename, retries=5):
             await telegram_client.download_media(media, filename)
             return filename
         except TimeoutError:
-            print(f"Lỗi timeout: Đang thử lại lần thứ {attempt + 1}/{retries}")
+            print(f"TimeoutError: Retry {attempt + 1}/{retries}")
             if attempt + 1 == retries:
                 raise
             await asyncio.sleep(5)
 
-async def download_and_send_messages(thread):
+async def join_group_or_channel(telegram_channel):
+    async with telegram_client:
+        if "t.me/joinchat" in telegram_channel or "t.me/+" in telegram_channel:
+            try:
+                invite_code = telegram_channel.split('/')[-1][1:]
+                await telegram_client(ImportChatInviteRequest(invite_code))
+            except InviteHashExpiredError:
+                print("Link mời đã bị lỗi / hết hạn!")
+                return False
+        else:
+            try:
+                await telegram_client(functions.channels.JoinChannelRequest(channel=telegram_channel.split('/')[-1]))
+                print(f"Đã tham gia vào kênh: {telegram_channel}")
+            except (ChannelPrivateError, ChatAdminRequiredError):
+                print("Lỗi khi tham gia vào kênh này, có thể là do kênh private hoặc cần sự ủy quyền từ Admin.")
+                return False
+        return True
+
+async def download_and_send_messages(thread, telegram_channel):
+    joined = await join_group_or_channel(telegram_channel)
+    if not joined:
+        await thread.send("Lỗi khi tham gia vào nhóm / kênh Telegram. Xin hãy cung cấp 1 Link lời mời hợp lệ!")
+        return
+
     async with telegram_client:
         print('=== Bắt đầu tải hình ảnh từ Telegram! ===')
         photos = await telegram_client.get_messages(telegram_channel, None, filter=InputMessagesFilterPhotos)
@@ -99,14 +131,35 @@ async def download_and_send_messages(thread):
             except Exception as e:
                 print(f"Đã xảy ra lỗi khi tải: {filename}: {e}")
 
+    # Xóa thư mục "telegram" sau khi hoàn tất
+    if os.path.exists('./telegram/'):
+        shutil.rmtree('./telegram/')
+        print('Đã xóa thư mục "telegram"')
+
+@bot.slash_command(description="Tải nội dung từ Telegram và gửi vào chủ đề Discord")
+async def crawl(ctx, discord_thread_id: discord.Option(str, description="Nhập ID chủ đề Discord"), telegram_channel: discord.Option(str, description="Nhập Link từ Telegram")):
+    await ctx.defer()
+    try:
+        await ctx.send_followup(f"Bắt đầu tải từ {telegram_channel} vào chủ đề {discord_thread_id}")
+        thread = bot.get_channel(int(discord_thread_id))
+        if thread is None:
+            await ctx.send_followup(f'Không thể tìm thấy chủ đề với ID: {discord_thread_id} trên Discord!')
+        else:
+            await download_and_send_messages(thread, telegram_channel)
+            await ctx.send_followup(f"Đã hoàn tất tải từ {telegram_channel} vào chủ đề {discord_thread_id}")
+    except Exception as e:
+        await ctx.send_followup(f"Đã xảy ra lỗi: {e}")
+
 @bot.event
 async def on_ready():
+
+    utc_offset = pytz.timezone('Asia/Ho_Chi_Minh')
+    current_time_utc7 = datetime.datetime.now(utc_offset).strftime("%H:%M - %d/%m")
+    utc = datetime.datetime.now(pytz.utc).strftime("%H:%M - %d/%m")
+    time = f"🌏 {current_time_utc7} GMT+7 | {utc} UTC 🌏"
+    activity=discord.Activity(type=discord.ActivityType.playing, name="Telegram Desktop", state=time)
+    await bot.change_presence(status=discord.Status.dnd, activity=activity)
     print(f'Đã đăng nhập với Bot: {bot.user}')
-    thread = bot.get_channel(int(discord_thread_id))
-    if thread is None:
-        print(f'Không thể tìm thấy chủ đề với ID: {discord_thread_id} trên Discord!')
-    else:
-        await download_and_send_messages(thread)
 
 if not os.path.exists('./telegram/'):
     os.makedirs('./telegram/')
