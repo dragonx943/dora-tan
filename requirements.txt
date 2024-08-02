@@ -8,3 +8,4 @@ py-cord
 moviepy
 datetime
 pytz
+psutil
