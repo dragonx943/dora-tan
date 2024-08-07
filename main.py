@@ -37,15 +37,21 @@ async def send_file_to_discord(file_path, thread):
 def get_random_color():
     return discord.Color(random.randint(0, 0xFFFFFF))
 
-def split_video(file_path, segment_duration=60):
+def split_video(file_path, target_size_mb=48):
     video = VideoFileClip(file_path)
-    total_duration = int(video.duration)
+    total_duration = video.duration
+
+    total_size_bytes = os.path.getsize(file_path)
+    bitrate = (total_size_bytes * 8) / total_duration
+    target_size_bytes = target_size_mb * 1024 * 1024
+    target_duration = (target_size_bytes * 8) / bitrate
+
     current_start = 0
     parts = []
     part_index = 0
 
     while current_start < total_duration:
-        current_end = min(total_duration, current_start + segment_duration)
+        current_end = min(total_duration, current_start + target_duration)
         part_path = f"{file_path}_part{part_index}.mp4"
 
         try:
