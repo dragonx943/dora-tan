@@ -10,11 +10,18 @@ import discord
 from discord.ext import commands
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 from moviepy.video.io.VideoFileClip import VideoFileClip
+from selenium import webdriver
+from selenium.webdriver.common.by import By
 import psutil
 import platform
 from datetime import datetime, timedelta
 import random
+import time
+import json
 
+BOT_OWNER_ID = 
+required_server_id = 
+required_role_id = 
 api_id = 
 api_hash = ''
 telegram_client = TelegramClient('', api_id, api_hash)
@@ -37,7 +44,64 @@ async def send_file_to_discord(file_path, thread):
 def get_random_color():
     return discord.Color(random.randint(0, 0xFFFFFF))
 
-def split_video(file_path, target_size_mb=48):
+def init_driver():
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    driver = webdriver.Chrome(options=options)
+    return driver
+
+def load_cookies(driver, cookie_file):
+    with open(cookie_file, "r") as file:
+        cookies = json.load(file)
+        for cookie in cookies:
+            if 'expiry' in cookie:
+                try:
+                    cookie['expiry'] = int(cookie['expiry'])
+                except (ValueError, TypeError):
+                    del cookie['expiry']
+            if 'sameSite' in cookie:
+                del cookie['sameSite']
+            driver.add_cookie(cookie)
+
+def login_netflix(driver, type, code):
+    url = f"https://www.netflix.com/{type}"
+    driver.get(url)
+    time.sleep(2)
+    load_cookies(driver, "cookie.json")
+    driver.refresh()
+    time.sleep(2)
+    pin_inputs = driver.find_elements(By.CLASS_NAME, 'pin-number-input')
+    code_digits = list(code.replace('-', ''))
+    for i in range(min(len(pin_inputs), len(code_digits))):
+        pin_inputs[i].send_keys(code_digits[i])
+    submit_button = driver.find_element(By.CSS_SELECTOR, '.tvsignup-continue-button')
+    if submit_button.is_enabled():
+        submit_button.click()
+    else:
+        raise Exception("Nút gửi bị vô hiệu hóa.")
+    time.sleep(5)
+
+def convert_cookies_to_json_from_content(file_content):
+    cookies = []
+    for line in file_content.splitlines():
+        if not line.startswith('#') and line.strip():
+            parts = line.split('\t')
+            if len(parts) >= 7:
+                cookie = {
+                    'domain': parts[0],
+                    'httpOnly': 'HttpOnly' in parts[0],
+                    'path': parts[2],
+                    'secure': parts[3].lower() == 'true',
+                    'expiry': int(parts[4]) if parts[4] != "0" else None,
+                    'name': parts[5],
+                    'value': parts[6].strip()
+                }
+                if cookie['expiry'] is None:
+                    del cookie['expiry']
+                cookies.append(cookie)
+    return cookies
+
+def split_video(file_path, target_size_mb=40):
     video = VideoFileClip(file_path)
     total_duration = video.duration
 
@@ -271,11 +335,87 @@ async def ping(ctx):
 
     await ctx.send_followup(embed=embed)
 
+@bot.slash_command(description="Nhập Cookie vào Bot (chỉ Dev dùng)")
+async def add(ctx, file: discord.Attachment):
+    await ctx.defer()
+
+    if ctx.author.id != BOT_OWNER_ID:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi: Bạn không có quyền sử dụng lệnh này! Hint: Tuổi loz sánh vai?**")
+        return
+
+    file_content = await file.read()
+    file_content = file_content.decode("utf-8")
+
+    try:
+        if os.path.exists('cookie.txt'):
+            os.remove('cookie.txt')
+
+        with open('cookie.txt', 'w') as txtfile:
+            txtfile.write(file_content)
+
+        cookies_json = convert_cookies_to_json_from_content(file_content)
+        with open('cookie.json', 'w') as outfile:
+            json.dump(cookies_json, outfile, indent=4)
+        await ctx.followup.send("**<a:sip:1149986505964662815> Đã nhập Cookie vào Bot thành cmn công! Đã có thể sử dụng lệnh /login**")
+
+    except Exception as e:
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi nhập Cookie:** {str(e)}")
+
+@bot.slash_command(description="Lấy bánh quy Netflix miễn phí !???")
+async def send(ctx):
+    await ctx.defer()
+
+    if ctx.guild.id != required_server_id:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Máy chủ này không được phép sử dụng lệnh này. Hint: Chạy đâu con sâu !???**")
+        return
+
+    role = discord.utils.get(ctx.author.roles, id=required_role_id)
+
+    if not role:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Bạn chưa có quyền để sử dụng lệnh này! Hint: Đúng máy chủ nhưng chưa Pick Role!**")
+        return
+
+    try:
+        with open('cookie.txt', 'rb') as txtfile:
+            await ctx.author.send("**Hướng dẫn sử dụng bánh quy Netflix:** https://www.youtube.com/watch?v=-KDyyEmyzt0")
+            await ctx.author.send(file=discord.File(txtfile, 'cookie.txt'))
+        await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi bánh quy thành công! Xin hãy kiểm tra hộp thư đến của Discord!**")
+    
+    except Exception as e:
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi gửi bánh quy:** {str(e)}")
+
+@bot.slash_command(name="login", description="Hỗ trợ đăng nhập Netflix trên Smart TV!")
+async def login(ctx, type: discord.Option(str, description="Trên màn hình của bạn là loại TV nào? Ví dụ: netflix.com/tv2 thì nhập tv2"), code: discord.Option(str, description="Nhập code của TV vào đây!")):
+    await ctx.defer()
+
+    if ctx.guild.id != required_server_id:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Máy chủ này không được phép sử dụng lệnh này. Hint: Chạy đâu con sâu !???**")
+        return
+
+    role = discord.utils.get(ctx.author.roles, id=required_role_id)
+
+    if not role:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Bạn chưa có quyền để sử dụng lệnh này! Hint: Đúng máy chủ nhưng chưa Pick Role!**")
+        return
+
+    if not type.startswith("tv"):
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Loại TV bạn nhập không hợp lệ, xin hãy thử lại! Ví dụ: Trên phần đăng nhập Netflix TV ghi: netflix.com/tv2 thì bạn nhập giá trị `tv2` vào Bot!**")
+        return
+
+    driver = init_driver()
+    try:
+        login_netflix(driver, type, code)
+        await ctx.followup.send("**<a:sip:1149986505964662815> Bạn đã đăng nhập thành công vào Netflix trên TV! Hãy tận hưởng!**")
+    except Exception as e:
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đăng nhập thất bại, xin hãy thử lại:** {str(e)}")
+    finally:
+        driver.quit()
+
 @bot.event
 async def on_ready():
     if not hasattr(bot, 'uptime'):
         bot.uptime = datetime.now()
-    activity=discord.Activity(type=discord.ActivityType.playing, name="Telegram Desktop", state="Bạn đọc dòng này làm gì? Bạn thích tôi à?")
+    activity=discord.Activity(type=discord.ActivityType.playing, name="đùa với tình cảm của bạn!", state="Bạn đọc dòng này làm gì? Bạn thích tôi à?")
     await bot.change_presence(status=discord.Status.dnd, activity=activity)
     print(f'Đã đăng nhập với Bot: {bot.user}')
 
