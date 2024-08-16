@@ -9,3 +9,4 @@ moviepy
 datetime
 pytz
 psutil
+selenium
