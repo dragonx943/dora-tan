@@ -19,7 +19,10 @@ import random
 import time
 import json
 
+last_add_timestamp = None
+last_steam_usage = {}
 BOT_OWNER_ID = 
+steam_role= 
 required_server_id = 
 required_role_id = 
 api_id = 
@@ -47,6 +50,7 @@ def get_random_color():
 def init_driver():
     options = webdriver.ChromeOptions()
     options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
     driver = webdriver.Chrome(options=options)
     return driver
 
@@ -346,6 +350,9 @@ async def add(ctx, file: discord.Attachment):
     file_content = await file.read()
     file_content = file_content.decode("utf-8")
 
+    global last_add_timestamp
+    last_add_timestamp = int(time.time())
+
     try:
         if os.path.exists('cookie.txt'):
             os.remove('cookie.txt')
@@ -379,6 +386,7 @@ async def send(ctx):
         with open('cookie.txt', 'rb') as txtfile:
             await ctx.author.send("**Hướng dẫn sử dụng bánh quy Netflix:** https://www.youtube.com/watch?v=-KDyyEmyzt0")
             await ctx.author.send(file=discord.File(txtfile, 'cookie.txt'))
+            await ctx.author.send(f"**# <a:remdance:1149986502001045504> Cập nhật lần cuối: <t:{last_add_timestamp}:R>**")
         await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi bánh quy thành công! Xin hãy kiểm tra hộp thư đến của Discord!**")
     
     except Exception as e:
@@ -406,10 +414,49 @@ async def login(ctx, type: discord.Option(str, description="Trên màn hình c�
     try:
         login_netflix(driver, type, code)
         await ctx.followup.send("**<a:sip:1149986505964662815> Bạn đã đăng nhập thành công vào Netflix trên TV! Hãy tận hưởng!**")
+        await ctx.followup.send(f"**<a:remdance:1149986502001045504> Cập nhật lần cuối: <t:{last_add_timestamp}:R>**")
     except Exception as e:
         await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đăng nhập thất bại, xin hãy thử lại:** {str(e)}")
     finally:
         driver.quit()
+
+@bot.slash_command(name="steam", description="Lấy tài khoản Steam ngẫu nhiên miễn phí !???")
+async def steam(ctx):
+    await ctx.defer()
+
+    if ctx.guild.id != required_server_id:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Máy chủ này không được phép sử dụng lệnh này. Hint: Chạy đâu con sâu !???**")
+        return
+
+    role = discord.utils.get(ctx.author.roles, id=steam_role)
+
+    if not role:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Bạn chưa có quyền để sử dụng lệnh này! Hint: Đúng máy chủ nhưng chưa Pick Role!**")
+        return
+
+    user_id = ctx.author.id
+    current_time = time.time()
+
+    if user_id in last_steam_usage and (current_time - last_steam_usage[user_id]) < 86400:
+        time_remaining = 86400 - (current_time - last_steam_usage[user_id])
+        hours_remaining = int(time_remaining // 3600)
+        minutes_remaining = int((time_remaining % 3600) // 60)
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Bạn đã đạt giới hạn lượt dùng! Vui lòng thử lại sau: `{hours_remaining} giờ {minutes_remaining} phút`!**")
+        return
+
+    try:
+        with open('steam.txt', 'r') as file:
+            lines = file.readlines()
+            if lines:
+                selected_line = random.choice(lines).strip()
+                await ctx.author.send(f"**# <a:remdance:1149986502001045504> Tài khoản Steam của bạn là:** `{selected_line}`")
+                await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi tài khoản Steam thành công! Xin hãy kiểm tra hộp thư đến của Discord!**")
+                last_steam_usage[user_id] = current_time
+            else:
+                await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không tìm thấy tài khoản Steam nào trong máy chủ!**")
+    
+    except Exception as e:
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi lấy tài khoản Steam:** {str(e)}")
 
 @bot.event
 async def on_ready():
