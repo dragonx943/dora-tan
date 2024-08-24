@@ -361,7 +361,7 @@ async def crawl(ctx, discord_thread_id: discord.Option(str, description="Nhập 
         if thread.last_message and thread.last_message.content == "**<a:zerotwo:1149986532678189097> Lỗi: Nhóm / Kênh đã được tham gia trước đó, vui lòng dùng `/leave` để rời nhóm / kênh**":
             await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn! Vui lòng kiểm tra lỗi tại <#{discord_thread_id}>!**")
         else:
-            await download_and_send_messages(thread, telegram_channel)
+            await download_and_send_messages(thread, telegram_channel, server_id)
             await ctx.send_followup(f"**<a:emoji_anime:1149986363802918922> Đã thực thi xong câu lệnh! Xin hãy kiểm tra tại: <#{discord_thread_id}>!**")
     except Exception as e:
         await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn: {e}**")
