@@ -8,6 +8,7 @@ from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterDocu
 from telethon.tl.functions.messages import ImportChatInviteRequest, GetHistoryRequest, DeleteMessagesRequest, DeleteChatUserRequest, SendMessageRequest
 import discord
 from discord.ext import commands
+from discord.ui import Select, View
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from selenium import webdriver
@@ -47,6 +48,32 @@ async def send_file_to_discord(file_path, thread):
 def get_random_color():
     return discord.Color(random.randint(0, 0xFFFFFF))
 
+def check_cookie_validity(cookie_path):
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+
+    driver = webdriver.Chrome(options=options)
+    try:
+        driver.get("https://www.netflix.com/browse")
+        driver.delete_all_cookies()
+
+        with open(cookie_path, 'r') as file:
+            cookies = json.load(file)
+        for cookie in cookies:
+            driver.add_cookie(cookie)
+        
+        driver.refresh()
+
+        try:
+            driver.find_element(By.CLASS_NAME, 'profile-icon')
+            return True
+        except:
+            return False
+    finally:
+        driver.quit()
+
 def init_driver():
     options = webdriver.ChromeOptions()
     options.add_argument("--headless")
@@ -67,11 +94,11 @@ def load_cookies(driver, cookie_file):
                 del cookie['sameSite']
             driver.add_cookie(cookie)
 
-def login_netflix(driver, type, code):
+def login_netflix(driver, type, code, cookie_file):
     url = f"https://www.netflix.com/{type}"
     driver.get(url)
     time.sleep(2)
-    load_cookies(driver, "cookie.json")
+    load_cookies(driver, cookie_file)
     driver.refresh()
     time.sleep(2)
     pin_inputs = driver.find_elements(By.CLASS_NAME, 'pin-number-input')
@@ -106,6 +133,40 @@ def convert_cookies_to_json_from_content(file_content):
     return cookies
 
 def split_video(file_path, target_size_mb=40):
+    video = VideoFileClip(file_path)
+    total_duration = video.duration
+
+    total_size_bytes = os.path.getsize(file_path)
+    bitrate = (total_size_bytes * 8) / total_duration
+    target_size_bytes = target_size_mb * 1024 * 1024
+    target_duration = (target_size_bytes * 8) / bitrate
+
+    current_start = 0
+    parts = []
+    part_index = 0
+
+    while current_start < total_duration:
+        current_end = min(total_duration, current_start + target_duration)
+        part_path = f"{file_path}_part{part_index}.mp4"
+
+        try:
+            ffmpeg_extract_subclip(file_path, current_start, current_end, targetname=part_path)
+            parts.append(part_path)
+            print(f"Đang chia thành đoạn thứ {part_index} từ phân cảnh {current_start} đến {current_end}")
+            current_start = current_end
+            part_index += 1
+        except Exception as e:
+            print(f"Đã xảy ra lỗi khi tách file video: {e}")
+            break
+
+    if video.reader:
+        video.reader.close()
+    if video.audio and video.audio.reader:
+        video.audio.reader.close_proc()
+
+    return parts
+
+def split_video_1(file_path, target_size_mb=90):
     video = VideoFileClip(file_path)
     total_duration = video.duration
 
@@ -189,7 +250,7 @@ async def join_group_or_channel(telegram_channel):
             print(f"Lỗi không xác định khi tham gia vào kênh/nhóm: {e}")
             return None
 
-async def download_and_send_messages(thread, telegram_channel):
+async def download_and_send_messages(thread, telegram_channel, server_id):
     entity = await join_group_or_channel(telegram_channel)
     if entity == 'already_a_participant':
         await thread.send("**<a:zerotwo:1149986532678189097> Lỗi: Nhóm / Kênh đã được tham gia trước đó, vui lòng dùng `/leave` để rời nhóm / kênh**")
@@ -232,7 +293,10 @@ async def download_and_send_messages(thread, telegram_channel):
                 print(f"Đang tải video: {index} / {total_messages} | Tên tệp: {filename}")
                 await download_file(message.video, filename)
                 if os.path.getsize(filename) > 50 * 1024 * 1024:
-                    parts = split_video(filename)
+                    if server_id == required_server_id:
+                        parts = split_video_1(filename)
+                    else:
+                        parts = split_video(filename)
                     for part in parts:
                         await send_file_to_discord(part, thread)
                         os.remove(part)
@@ -255,6 +319,7 @@ async def download_and_send_messages(thread, telegram_channel):
 
     shutil.rmtree(work_dir)
     print(f'Đã xóa thư mục: "{work_dir}"')
+
 
 async def leave_group_or_delete_messages(telegram_channel):
     async with telegram_client:
@@ -285,6 +350,8 @@ async def leave_group_or_delete_messages(telegram_channel):
 @bot.slash_command(description="Tải nội dung từ Telegram và gửi vào chủ đề Discord ?")
 async def crawl(ctx, discord_thread_id: discord.Option(str, description="Nhập ID chủ đề Discord vào đây!"), telegram_channel: discord.Option(str, description="Nhập Link mời từ Telegram vào đây!")):
     await ctx.defer()
+
+    server_id = ctx.guild.id
     try:
         await ctx.send_followup(f"**<a:sip:1149986505964662815> Bắt đầu tải dữ liệu từ `{telegram_channel}` vào chủ đề <#{discord_thread_id}>**")
         thread = bot.get_channel(int(discord_thread_id))
@@ -339,34 +406,107 @@ async def ping(ctx):
 
     await ctx.send_followup(embed=embed)
 
-@bot.slash_command(description="Nhập Cookie vào Bot (chỉ Dev dùng)")
-async def add(ctx, file: discord.Attachment):
+@bot.slash_command(description="Quản lí File máy chủ (chỉ Dev dùng)")
+async def manager(ctx):
     await ctx.defer()
 
     if ctx.author.id != BOT_OWNER_ID:
         await ctx.followup.send("**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi: Bạn không có quyền sử dụng lệnh này! Hint: Tuổi loz sánh vai?**")
         return
 
-    file_content = await file.read()
-    file_content = file_content.decode("utf-8")
+    embed = discord.Embed(
+        title="😉 Bảng phong thần của Dev!",
+        description="💻 Đây là bảng phong thần, vui lòng chọn những thiết đặt có sẵn ở dưới!",
+        color=get_random_color()
+    )
+
+    select = Select(
+        placeholder="Hãy lựa chọn tại đây...",
+        options=[
+            discord.SelectOption(label="➕ Thêm Cookie", value="add"),
+            discord.SelectOption(label="➖ Xóa Cookie", value="delete")
+        ]
+    )
+
+    async def select_callback(interaction):
+        if select.values[0] == "add":
+            await interaction.response.send_message("**<a:remdance:1149986502001045504> Hãy kiểm tra tin nhắn riêng tư để tải Cookie lên!**", ephemeral=True)
+
+            dm_channel = await interaction.user.create_dm()
+            await dm_channel.send("**<a:remdance:1149986502001045504> Xin hãy tải Cookie lên theo tin nhắn này: **")
+
+            def check(m):
+                return m.author == interaction.user and m.attachments
+
+            msg = await bot.wait_for("message", check=check)
+            file = msg.attachments[0]
+
+            file_content = await file.read()
+            file_content = file_content.decode("utf-8")
+
+            if not os.path.exists('uncon_netflix'):
+                os.makedirs('uncon_netflix')
+            if not os.path.exists('con_netflix'):
+                os.makedirs('con_netflix')
+
+            existing_files = os.listdir('uncon_netflix')
+            file_number = len(existing_files) + 1
+
+            uncon_filename = f'netflix_cookie_{file_number}.txt'
+            with open(os.path.join('uncon_netflix', uncon_filename), 'w') as txtfile:
+                txtfile.write(file_content)
+
+            cookies_json = convert_cookies_to_json_from_content(file_content)
+            con_filename = f'netflix_cookie_{file_number}.json'
+            with open(os.path.join('con_netflix', con_filename), 'w') as jsonfile:
+                json.dump(cookies_json, jsonfile, indent=4)
+
+            await interaction.followup.send(f"**<a:sip:1149986505964662815> Đã nhập Cookie vào Bot thành cmn công! Đã có thể sử dụng lệnh /login**")
+
+        elif select.values[0] == "delete":
+            files = os.listdir('uncon_netflix')
+            if not files:
+                await interaction.response.send_message("**<a:zerotwo:1149986532678189097> Không có File nào để xóa hếtttttttttttt!**")
+                return
+
+            delete_options = [
+                discord.SelectOption(label=filename, value=filename)
+                for filename in files
+            ]
+
+            delete_select = Select(
+                placeholder="Hãy chọn File để xóa...",
+                options=delete_options
+            )
+
+            async def delete_select_callback(interaction):
+                chosen_file = delete_select.values[0]
+                json_file = chosen_file.replace('.txt', '.json')
+
+                # Delete the files
+                os.remove(os.path.join('uncon_netflix', chosen_file))
+                os.remove(os.path.join('con_netflix', json_file))
+
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
+
+                await interaction.followup.send(f"**<a:sip:1149986505964662815> Đã xóa File thành công!**")
+
+            delete_select.callback = delete_select_callback
+
+            delete_view = View()
+            delete_view.add_item(delete_select)
+            await interaction.response.send_message(embed=embed, view=delete_view)
+
+    select.callback = select_callback
+
+    view = View()
+    view.add_item(select)
 
     global last_add_timestamp
     last_add_timestamp = int(time.time())
 
-    try:
-        if os.path.exists('cookie.txt'):
-            os.remove('cookie.txt')
-
-        with open('cookie.txt', 'w') as txtfile:
-            txtfile.write(file_content)
-
-        cookies_json = convert_cookies_to_json_from_content(file_content)
-        with open('cookie.json', 'w') as outfile:
-            json.dump(cookies_json, outfile, indent=4)
-        await ctx.followup.send("**<a:sip:1149986505964662815> Đã nhập Cookie vào Bot thành cmn công! Đã có thể sử dụng lệnh /login**")
-
-    except Exception as e:
-        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi nhập Cookie:** {str(e)}")
+    await ctx.followup.send(embed=embed, view=view)
 
 @bot.slash_command(description="Lấy bánh quy Netflix miễn phí !???")
 async def send(ctx):
@@ -383,10 +523,19 @@ async def send(ctx):
         return
 
     try:
-        with open('cookie.txt', 'rb') as txtfile:
+
+        files = [f for f in os.listdir('uncon_netflix') if f.endswith('.txt')]
+        if not files:
+            await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không có file Cookies nào trong thư mục hếtttttt!**")
+            return
+        chosen_file = random.choice(files)
+        file_path = os.path.join('uncon_netflix', chosen_file)
+
+        with open(file_path, 'rb') as txtfile:
             await ctx.author.send("**Hướng dẫn sử dụng bánh quy Netflix:** https://www.youtube.com/watch?v=-KDyyEmyzt0")
             await ctx.author.send(file=discord.File(txtfile, 'cookie.txt'))
             await ctx.author.send(f"**# <a:remdance:1149986502001045504> Cập nhật lần cuối: <t:{last_add_timestamp}:R>**")
+
         await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi bánh quy thành công! Xin hãy kiểm tra hộp thư đến của Discord!**")
     
     except Exception as e:
@@ -410,15 +559,39 @@ async def login(ctx, type: discord.Option(str, description="Trên màn hình c�
         await ctx.followup.send("**<a:zerotwo:1149986532678189097> Loại TV bạn nhập không hợp lệ, xin hãy thử lại! Ví dụ: Trên phần đăng nhập Netflix TV ghi: netflix.com/tv2 thì bạn nhập giá trị `tv2` vào Bot!**")
         return
 
-    driver = init_driver()
-    try:
-        login_netflix(driver, type, code)
-        await ctx.followup.send("**<a:sip:1149986505964662815> Bạn đã đăng nhập thành công vào Netflix trên TV! Hãy tận hưởng!**")
-        await ctx.followup.send(f"**<a:remdance:1149986502001045504> Cập nhật lần cuối: <t:{last_add_timestamp}:R>**")
-    except Exception as e:
-        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đăng nhập thất bại, xin hãy thử lại:** {str(e)}")
-    finally:
-        driver.quit()
+    files = [f for f in os.listdir('con_netflix') if f.endswith('.json')]
+    if not files:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không có file Cookie nào tồn tại hếtttttttt!**")
+        return
+
+    options = [discord.SelectOption(label=f, value=f) for f in files]
+    select = Select(placeholder="Chọn một file .json để đăng nhập vào Netflix", options=options)
+
+    async def select_callback(interaction):
+        await interaction.response.defer()
+        selected_file = select.values[0]
+        driver = init_driver()
+        try:
+            cookie_file = os.path.join('con_netflix', selected_file)
+            login_netflix(driver, type, code, cookie_file)
+            await interaction.followup.send("**<a:sip:1149986505964662815> Bạn đã đăng nhập thành công vào Netflix trên TV! Hãy tận hưởng!**")
+            await interaction.followup.send(f"**<a:remdance:1149986502001045504> Cập nhật lần cuối: <t:{last_add_timestamp}:R>**")
+        except Exception as e:
+            await interaction.followup.send(f"**<a:zerotwo:1149986532678189097> Đăng nhập thất bại, xin hãy thử lại:** {str(e)}")
+        finally:
+            driver.quit()
+
+    select.callback = select_callback
+
+    view = View()
+    view.add_item(select)
+
+    embed = discord.Embed(
+        title="🍪 Chọn File Cookie để đăng nhập! 🍪",
+        description="📂 Hãy chọn 1 File từ danh sách dưới đây để đăng nhập (Kiểm tra bánh = /check)",
+        color=get_random_color()
+    )
+    await ctx.followup.send(embed=embed, view=view)
 
 @bot.slash_command(name="steam", description="Lấy tài khoản Steam ngẫu nhiên miễn phí !???")
 async def steam(ctx):
@@ -457,6 +630,30 @@ async def steam(ctx):
     
     except Exception as e:
         await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi lấy tài khoản Steam:** {str(e)}")
+
+@bot.slash_command(name="check", description="Kiểm tra Netflix hiện có !???")
+async def check(ctx):
+    await ctx.defer()
+
+    files = os.listdir('con_netflix')
+    if not files:
+        await ctx.followup.send("Không có bánh nào ở đây cả!")
+        return
+    
+    results = []
+    for cookie_file in files:
+        cookie_path = f'con_netflix/{cookie_file}'
+        try:
+            valid = check_cookie_validity(cookie_path)
+            results.append(f"{'✅' if valid else '❌'} **{cookie_file}**")
+        except Exception as e:
+            results.append(f"**❌ {cookie_file}** Lỗi ({str(e)})")
+
+    embed = discord.Embed(title="🍪 Trình quản lý Netflix cho Dev 🍪", description="**🕘 Kết quả kiểm tra:**", color=get_random_color())
+    for result in results:
+        embed.add_field(name="📁 Tệp", value=result, inline=True)
+
+    await ctx.followup.send(embed=embed)
 
 @bot.event
 async def on_ready():
