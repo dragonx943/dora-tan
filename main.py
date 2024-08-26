@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 import random
 import time
 import json
+import pytz
 
 last_add_timestamp = None
 last_steam_usage = {}
@@ -34,13 +35,17 @@ discord_token = ''
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='#', intents=intents)
 
 logging.basicConfig(
     level=logging.INFO,
     format="(%(asctime)s) [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S"
 )
+logger = logging.getLogger()
+handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
+handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
+logger.addHandler(handler)
 
 async def send_file_to_discord(file_path, thread):
     await thread.send(file=discord.File(file_path))
@@ -50,7 +55,7 @@ def get_random_color():
 
 def check_cookie_validity(cookie_path):
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
 
@@ -76,7 +81,8 @@ def check_cookie_validity(cookie_path):
 
 def init_driver():
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     driver = webdriver.Chrome(options=options)
     return driver
@@ -200,7 +206,7 @@ def split_video_1(file_path, target_size_mb=90):
 
     return parts
 
-async def download_file(media, filename, retries=10):
+async def download_file(media, filename, retries=100):
     for attempt in range(retries):
         try:
             await telegram_client.download_media(media, filename)
@@ -263,6 +269,40 @@ async def download_and_send_messages(thread, telegram_channel, server_id):
     work_dir = f'./telegram_{invite_id}'
     os.makedirs(work_dir, exist_ok=True)
 
+    async def process_message(index, message, total_messages):
+        if message.photo:
+            filename = f"{work_dir}/{message.id}.jpg"
+            print(f"Đang tải ảnh: {index} / {total_messages} | Tên tệp: {filename}")
+            await download_file(message.photo, filename)
+            await send_file_to_discord(filename, thread)
+        elif message.video:
+            filename = f"{work_dir}/{message.id}.mp4"
+            print(f"Đang tải video: {index} / {total_messages} | Tên tệp: {filename}")
+            await download_file(message.video, filename)
+            if os.path.getsize(filename) > 50 * 1024 * 1024:
+                if server_id == required_server_id:
+                    parts = split_video_1(filename)
+                else:
+                    parts = split_video(filename)
+                for part in parts:
+                    await send_file_to_discord(part, thread)
+            else:
+                await send_file_to_discord(filename, thread)
+        elif message.document:
+            file_name = None
+            for attribute in message.document.attributes:
+                if isinstance(attribute, types.DocumentAttributeFilename):
+                    file_name = attribute.file_name
+                    break
+            if not file_name:
+                file_name = f"{message.id}"
+            filename = f"{work_dir}/{file_name}"
+            print(f"Đang tải tệp: {file_name}")
+            await download_file(message.document, filename)
+            await send_file_to_discord(filename, thread)
+        else:
+            print(f"Đã bỏ qua tin nhắn: {message.id} (không có nội dung hỗ trợ)")
+
     async with telegram_client:
         if isinstance(entity, types.User) and entity.bot:
             print('=== Bắt đầu tải tin nhắn từ bot Telegram! ===')
@@ -282,44 +322,11 @@ async def download_and_send_messages(thread, telegram_channel, server_id):
             messages = await telegram_client.get_messages(entity, limit=None)
 
         total_messages = len(messages)
-        for index, message in enumerate(messages, start=1):
-            if message.photo:
-                filename = f"{work_dir}/{message.id}.jpg"
-                print(f"Đang tải ảnh: {index} / {total_messages} | Tên tệp: {filename}")
-                await download_file(message.photo, filename)
-                await send_file_to_discord(filename, thread)
-            elif message.video:
-                filename = f"{work_dir}/{message.id}.mp4"
-                print(f"Đang tải video: {index} / {total_messages} | Tên tệp: {filename}")
-                await download_file(message.video, filename)
-                if os.path.getsize(filename) > 50 * 1024 * 1024:
-                    if server_id == required_server_id:
-                        parts = split_video_1(filename)
-                    else:
-                        parts = split_video(filename)
-                    for part in parts:
-                        await send_file_to_discord(part, thread)
-                        os.remove(part)
-                else:
-                    await send_file_to_discord(filename, thread)
-            elif message.document:
-                file_name = None
-                for attribute in message.document.attributes:
-                    if isinstance(attribute, types.DocumentAttributeFilename):
-                        file_name = attribute.file_name
-                        break
-                if not file_name:
-                    file_name = f"{message.id}"
-                filename = f"{work_dir}/{file_name}"
-                print(f"Đang tải tệp: {file_name}")
-                await download_file(message.document, filename)
-                await send_file_to_discord(filename, thread)
-            else:
-                print(f"Đã bỏ qua tin nhắn: {message.id} (không có nội dung hỗ trợ)")
+        tasks = [process_message(index, message, total_messages) for index, message in enumerate(messages, start=1)]
+        await asyncio.gather(*tasks)
 
     shutil.rmtree(work_dir)
     print(f'Đã xóa thư mục: "{work_dir}"')
-
 
 async def leave_group_or_delete_messages(telegram_channel):
     async with telegram_client:
@@ -350,8 +357,8 @@ async def leave_group_or_delete_messages(telegram_channel):
 @bot.slash_command(description="Tải nội dung từ Telegram và gửi vào chủ đề Discord ?")
 async def crawl(ctx, discord_thread_id: discord.Option(str, description="Nhập ID chủ đề Discord vào đây!"), telegram_channel: discord.Option(str, description="Nhập Link mời từ Telegram vào đây!")):
     await ctx.defer()
-
     server_id = ctx.guild.id
+
     try:
         await ctx.send_followup(f"**<a:sip:1149986505964662815> Bắt đầu tải dữ liệu từ `{telegram_channel}` vào chủ đề <#{discord_thread_id}>**")
         thread = bot.get_channel(int(discord_thread_id))
@@ -359,12 +366,13 @@ async def crawl(ctx, discord_thread_id: discord.Option(str, description="Nhập 
             await ctx.send_followup(f'**<a:zerotwo:1149986532678189097> Không thể tìm thấy chủ đề với ID: `{discord_thread_id}` trên Discord!**')
             return
         if thread.last_message and thread.last_message.content == "**<a:zerotwo:1149986532678189097> Lỗi: Nhóm / Kênh đã được tham gia trước đó, vui lòng dùng `/leave` để rời nhóm / kênh**":
-            await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn! Vui lòng kiểm tra lỗi tại <#{discord_thread_id}>!**")
+            await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn! Vui lòng kiểm tra lỗi tại: <#{discord_thread_id}>!**")
         else:
             await download_and_send_messages(thread, telegram_channel, server_id)
             await ctx.send_followup(f"**<a:emoji_anime:1149986363802918922> Đã thực thi xong câu lệnh! Xin hãy kiểm tra tại: <#{discord_thread_id}>!**")
     except Exception as e:
-        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn: {e}**")
+        print(f"Đã xảy ra lỗi ngoài ý muốn: {e}")
+        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn, vui lòng kiểm tra tại máy chủ!**")
 
 @bot.slash_command(description="Rời khỏi kênh / nhóm Telegram hoặc xóa tất cả tin nhắn từ người dùng / Bot Telegram ?")
 async def leave(ctx, telegram_channel: discord.Option(str, description="Nhập Link từ Telegram vào đây!")):
@@ -373,7 +381,7 @@ async def leave(ctx, telegram_channel: discord.Option(str, description="Nhập L
         result = await leave_group_or_delete_messages(telegram_channel)
         await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> {result}**")
     except Exception as e:
-        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn: {e}**")
+        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn!**")
 
 @bot.slash_command(description="Kiểm tra thông tin máy chủ ?")
 async def ping(ctx):
@@ -461,7 +469,7 @@ async def manager(ctx):
             with open(os.path.join('con_netflix', con_filename), 'w') as jsonfile:
                 json.dump(cookies_json, jsonfile, indent=4)
 
-            await interaction.followup.send(f"**<a:sip:1149986505964662815> Đã nhập Cookie vào Bot thành cmn công! Đã có thể sử dụng lệnh /login**")
+            await interaction.followup.send(f"**<a:sip:1149986505964662815> Đã nhập Cookie vào Bot thành cmn công! File imported successfully!**")
 
         elif select.values[0] == "delete":
             files = os.listdir('uncon_netflix')
@@ -490,7 +498,7 @@ async def manager(ctx):
                 if not interaction.response.is_done():
                     await interaction.response.defer()
 
-                await interaction.followup.send(f"**<a:sip:1149986505964662815> Đã xóa File thành công!**")
+                await interaction.followup.send(f"**<a:sip:1149986505964662815> Đã xóa File thành công! File deleted successfully!**")
 
             delete_select.callback = delete_select_callback
 
@@ -508,64 +516,64 @@ async def manager(ctx):
 
     await ctx.followup.send(embed=embed, view=view)
 
-@bot.slash_command(description="Lấy bánh quy Netflix miễn phí !???")
+@bot.slash_command(description="Lấy bánh quy Netflix miễn phí / Free Netflix Cookies !???")
 async def send(ctx):
     await ctx.defer()
 
     if ctx.guild.id != required_server_id:
-        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Máy chủ này không được phép sử dụng lệnh này. Hint: Chạy đâu con sâu !???**")
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi / E: Máy chủ này không được phép sử dụng lệnh này / This Discord Server is NOT ALLOWED! Hint: Chạy đâu con sâu / NO ESCAPE !???**")
         return
 
     role = discord.utils.get(ctx.author.roles, id=required_role_id)
 
     if not role:
-        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Bạn chưa có quyền để sử dụng lệnh này! Hint: Đúng máy chủ nhưng chưa Pick Role!**")
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi / E: Chưa có quyền sử dụng lệnh này / No permission to do that! Hint: Chưa Pick Role / Role Not Found!**")
         return
 
     try:
 
         files = [f for f in os.listdir('uncon_netflix') if f.endswith('.txt')]
         if not files:
-            await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không có file Cookies nào trong thư mục hếtttttt!**")
+            await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi / E: Không có file Cookies nào trong thư mục hếtttttt / Cookies NOT FOUND!**")
             return
         chosen_file = random.choice(files)
         file_path = os.path.join('uncon_netflix', chosen_file)
 
         with open(file_path, 'rb') as txtfile:
-            await ctx.author.send("**Hướng dẫn sử dụng bánh quy Netflix:** https://www.youtube.com/watch?v=-KDyyEmyzt0")
+            await ctx.author.send("**Hướng dẫn sử dụng bánh quy Netflix / HOW TO USE:** https://www.youtube.com/watch?v=-KDyyEmyzt0")
             await ctx.author.send(file=discord.File(txtfile, 'cookie.txt'))
-            await ctx.author.send(f"**# <a:remdance:1149986502001045504> Cập nhật lần cuối: <t:{last_add_timestamp}:R>**")
+            await ctx.author.send(f"**# <a:remdance:1149986502001045504> Cập nhật lần cuối / Last Update: <t:{last_add_timestamp}:R>**")
 
-        await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi bánh quy thành công! Xin hãy kiểm tra hộp thư đến của Discord!**")
+        await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi bánh quy thành công, hãy kiểm tra hộp thư đến! Cookies sent successfully, check ur inbox pls!**")
     
     except Exception as e:
-        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi gửi bánh quy:** {str(e)}")
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi gửi bánh quy / Error:** {str(e)}")
 
-@bot.slash_command(name="login", description="Hỗ trợ đăng nhập Netflix trên Smart TV!")
-async def login(ctx, type: discord.Option(str, description="Trên màn hình của bạn là loại TV nào? Ví dụ: netflix.com/tv2 thì nhập tv2"), code: discord.Option(str, description="Nhập code của TV vào đây!")):
+@bot.slash_command(name="login", description="Hỗ trợ đăng nhập Netflix trên Smart TV / Automatic login Netflix for TV!")
+async def login(ctx, type: discord.Option(str, description="Net của bạn là loại TV nào / What kind of TV is on screen? Ví dụ / Ex: netflix.com/tv2 -> tv2"), code: discord.Option(str, description="Nhập code của TV vào đây / Type TV Code here!")):
     await ctx.defer()
 
     if ctx.guild.id != required_server_id:
-        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Máy chủ này không được phép sử dụng lệnh này. Hint: Chạy đâu con sâu !???**")
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi / E: Máy chủ này không được phép sử dụng lệnh này / This Discord Server is NOT ALLOWED! Hint: Chạy đâu con sâu / NO ESCAPE !???**")
         return
 
     role = discord.utils.get(ctx.author.roles, id=required_role_id)
 
     if not role:
-        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Bạn chưa có quyền để sử dụng lệnh này! Hint: Đúng máy chủ nhưng chưa Pick Role!**")
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi / E: Chưa có quyền sử dụng lệnh này / No permission to do that! Hint: Chưa Pick Role / Role Not Found!**")
         return
 
     if not type.startswith("tv"):
-        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Loại TV bạn nhập không hợp lệ, xin hãy thử lại! Ví dụ: Trên phần đăng nhập Netflix TV ghi: netflix.com/tv2 thì bạn nhập giá trị `tv2` vào Bot!**")
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Loại TV bạn nhập không hợp lệ, xin hãy thử lại / Invalid TV Type, please try again! Ví dụ / Ex: netflix.com/tv2 -> Nhập / Type: tv2**")
         return
 
     files = [f for f in os.listdir('con_netflix') if f.endswith('.json')]
     if not files:
-        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không có file Cookie nào tồn tại hếtttttttt!**")
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi / E: Không có file Cookies nào trong thư mục hếtttttt / Cookies NOT FOUND!**")
         return
 
     options = [discord.SelectOption(label=f, value=f) for f in files]
-    select = Select(placeholder="Chọn một file .json để đăng nhập vào Netflix", options=options)
+    select = Select(placeholder="Hãy chọn 1 file / Choose a File!", options=options, max_values=1)
 
     async def select_callback(interaction):
         await interaction.response.defer()
@@ -574,24 +582,31 @@ async def login(ctx, type: discord.Option(str, description="Trên màn hình c�
         try:
             cookie_file = os.path.join('con_netflix', selected_file)
             login_netflix(driver, type, code, cookie_file)
-            await interaction.followup.send("**<a:sip:1149986505964662815> Bạn đã đăng nhập thành công vào Netflix trên TV! Hãy tận hưởng!**")
-            await interaction.followup.send(f"**<a:remdance:1149986502001045504> Cập nhật lần cuối: <t:{last_add_timestamp}:R>**")
+            await interaction.followup.send("**<a:sip:1149986505964662815> Bạn đã đăng nhập thành công vào Netflix trên TV! TV Login Successfully!**")
+            await interaction.followup.send(f"**<a:remdance:1149986502001045504> Cập nhật lần cuối / Last Update: <t:{last_add_timestamp}:R>**")
         except Exception as e:
-            await interaction.followup.send(f"**<a:zerotwo:1149986532678189097> Đăng nhập thất bại, xin hãy thử lại:** {str(e)}")
+            await interaction.followup.send(f"**<a:zerotwo:1149986532678189097> Đăng nhập thất bại, xin hãy thử lại / TV Login Failed, please try again:** {str(e)}")
         finally:
             driver.quit()
-
+        view.clear_items()
+        await interaction.message.edit(view=view)
+    
     select.callback = select_callback
 
-    view = View()
+    view = View(timeout=30)
     view.add_item(select)
 
     embed = discord.Embed(
-        title="🍪 Chọn File Cookie để đăng nhập! 🍪",
-        description="📂 Hãy chọn 1 File từ danh sách dưới đây để đăng nhập (Kiểm tra bánh = /check)",
+        title="🍪 Chọn 1 File để đăng nhập / Choose a File to Login! 🍪",
+        description="📂 Hãy chọn 1 File từ bảng dưới đây để đăng nhập! (Kiểm tra bánh / Check File Valid or Invalid = /check)",
         color=get_random_color()
     )
-    await ctx.followup.send(embed=embed, view=view)
+
+    message = await ctx.followup.send(embed=embed, view=view)
+
+    await view.wait()
+    if not select.values:
+        await message.delete()
 
 @bot.slash_command(name="steam", description="Lấy tài khoản Steam ngẫu nhiên miễn phí !???")
 async def steam(ctx):
@@ -640,18 +655,26 @@ async def check(ctx):
         await ctx.followup.send("Không có bánh nào ở đây cả!")
         return
     
+    timestamp = int(time.time())
+    tz = pytz.timezone('Asia/Ho_Chi_Minh')
+    embed_timestamp = datetime.utcfromtimestamp(timestamp).replace(tzinfo=pytz.utc).astimezone(tz)
     results = []
     for cookie_file in files:
         cookie_path = f'con_netflix/{cookie_file}'
         try:
             valid = check_cookie_validity(cookie_path)
-            results.append(f"{'✅' if valid else '❌'} **{cookie_file}**")
+            results.append(f"**└> {cookie_file}** {'**-> ✅**' if valid else '**-> ❌**'}")
         except Exception as e:
-            results.append(f"**❌ {cookie_file}** Lỗi ({str(e)})")
+            results.append(f"**└> {cookie_file}** **❌ Lỗi kiểm tra!**")
 
-    embed = discord.Embed(title="🍪 Trình quản lý Netflix cho Dev 🍪", description="**🕘 Kết quả kiểm tra:**", color=get_random_color())
+    embed = discord.Embed(
+        title="🍪 Công cụ kiểm tra Netflix bởi Draken 🍪",
+        description="**🕘 Kết quả - Result:**",
+        color=get_random_color(),
+        timestamp=embed_timestamp
+    )
     for result in results:
-        embed.add_field(name="📁 Tệp", value=result, inline=True)
+        embed.add_field(name="📁 Tệp kiểm tra:", value=result, inline=True)
 
     await ctx.followup.send(embed=embed)
 
