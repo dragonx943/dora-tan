@@ -20,6 +20,12 @@ import random
 import time
 import json
 import pytz
+import urllib.parse
+import zipfile
+import io
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 last_add_timestamp = None
 last_steam_usage = {}
@@ -53,39 +59,46 @@ async def send_file_to_discord(file_path, thread):
 def get_random_color():
     return discord.Color(random.randint(0, 0xFFFFFF))
 
-def check_cookie_validity(cookie_path):
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
+def download_file_with_retry(url, local_filename):
+    session = requests.Session()
+    retry = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
 
-    driver = webdriver.Chrome(options=options)
-    try:
-        driver.get("https://www.netflix.com/browse")
-        driver.delete_all_cookies()
-
-        with open(cookie_path, 'r') as file:
-            cookies = json.load(file)
-        for cookie in cookies:
-            driver.add_cookie(cookie)
-        
-        driver.refresh()
-
-        try:
-            driver.find_element(By.CLASS_NAME, 'profile-icon')
-            return True
-        except:
-            return False
-    finally:
-        driver.quit()
+    with session.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(local_filename, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192): 
+                if chunk:
+                    f.write(chunk)
+    return local_filename
 
 def init_driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
+    options = webdriver.FirefoxOptions()
+    options.add_argument("--headless")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
-    driver = webdriver.Chrome(options=options)
+    driver = webdriver.Firefox(options=options)
     return driver
+
+def check_cookie_validity(cookie_path):
+    with open(cookie_path, 'r') as file:
+        cookies = json.load(file)
+    
+    session = requests.Session()
+    retry = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
+    for cookie in cookies:
+        session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'], path=cookie['path'])
+
+    response = session.get("https://www.netflix.com/browse")
+    if "profiles" in response.text:
+        return True
+    return False
 
 def load_cookies(driver, cookie_file):
     with open(cookie_file, "r") as file:
@@ -259,7 +272,7 @@ async def join_group_or_channel(telegram_channel):
 async def download_and_send_messages(thread, telegram_channel, server_id):
     entity = await join_group_or_channel(telegram_channel)
     if entity == 'already_a_participant':
-        await thread.send("**<a:zerotwo:1149986532678189097> Lỗi: Nhóm / Kênh đã được tham gia trước đó, vui lòng dùng `/leave` để rời nhóm / kênh**")
+        await thread.send("**<a:zerotwo:1149986532678189097> Lỗi: Nhóm / Kênh đã được tham gia trước đó, vui lòng dùng `/leave_telegram` để rời nhóm / kênh**")
         return
     if not entity:
         await thread.send("**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi tham gia vào nhóm / kênh Telegram. Xin hãy cung cấp 1 Link lời mời hợp lệ!**")
@@ -355,7 +368,7 @@ async def leave_group_or_delete_messages(telegram_channel):
             return f"Lỗi khi rời khỏi kênh / nhóm Telegram hoặc xóa tin nhắn Telegram: {e}"
 
 @bot.slash_command(description="Tải nội dung từ Telegram và gửi vào chủ đề Discord ?")
-async def crawl(ctx, discord_thread_id: discord.Option(str, description="Nhập ID chủ đề Discord vào đây!"), telegram_channel: discord.Option(str, description="Nhập Link mời từ Telegram vào đây!")):
+async def telegram(ctx, discord_thread_id: discord.Option(str, description="Nhập ID chủ đề Discord vào đây!"), telegram_channel: discord.Option(str, description="Nhập Link mời từ Telegram vào đây!")):
     await ctx.defer()
     server_id = ctx.guild.id
 
@@ -365,7 +378,7 @@ async def crawl(ctx, discord_thread_id: discord.Option(str, description="Nhập 
         if thread is None:
             await ctx.send_followup(f'**<a:zerotwo:1149986532678189097> Không thể tìm thấy chủ đề với ID: `{discord_thread_id}` trên Discord!**')
             return
-        if thread.last_message and thread.last_message.content == "**<a:zerotwo:1149986532678189097> Lỗi: Nhóm / Kênh đã được tham gia trước đó, vui lòng dùng `/leave` để rời nhóm / kênh**":
+        if thread.last_message and thread.last_message.content == "**<a:zerotwo:1149986532678189097> Lỗi: Nhóm / Kênh đã được tham gia trước đó, vui lòng dùng `/leave_telegram` để rời nhóm / kênh**":
             await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn! Vui lòng kiểm tra lỗi tại: <#{discord_thread_id}>!**")
         else:
             await download_and_send_messages(thread, telegram_channel, server_id)
@@ -375,7 +388,7 @@ async def crawl(ctx, discord_thread_id: discord.Option(str, description="Nhập 
         await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn, vui lòng kiểm tra tại máy chủ!**")
 
 @bot.slash_command(description="Rời khỏi kênh / nhóm Telegram hoặc xóa tất cả tin nhắn từ người dùng / Bot Telegram ?")
-async def leave(ctx, telegram_channel: discord.Option(str, description="Nhập Link từ Telegram vào đây!")):
+async def leave_telegram(ctx, telegram_channel: discord.Option(str, description="Nhập Link từ Telegram vào đây!")):
     await ctx.defer()
     try:
         result = await leave_group_or_delete_messages(telegram_channel)
@@ -427,6 +440,7 @@ async def manager(ctx):
         description="💻 Đây là bảng phong thần, vui lòng chọn những thiết đặt có sẵn ở dưới!",
         color=get_random_color()
     )
+    embed.set_image(url="https://raw.githubusercontent.com/dragonx943/listcaidaubuoi/main/campFire.gif")
 
     select = Select(
         placeholder="Hãy lựa chọn tại đây...",
@@ -470,6 +484,7 @@ async def manager(ctx):
                 json.dump(cookies_json, jsonfile, indent=4)
 
             await interaction.followup.send(f"**<a:sip:1149986505964662815> Đã nhập Cookie vào Bot thành cmn công! File imported successfully!**")
+            view.clear_items()
 
         elif select.values[0] == "delete":
             files = os.listdir('uncon_netflix')
@@ -596,11 +611,17 @@ async def login(ctx, type: discord.Option(str, description="Net của bạn là 
     view = View(timeout=30)
     view.add_item(select)
 
+    latency = round(bot.latency * 1000)
+
     embed = discord.Embed(
-        title="🍪 Chọn 1 File để đăng nhập / Choose a File to Login! 🍪",
-        description="📂 Hãy chọn 1 File từ bảng dưới đây để đăng nhập! (Kiểm tra bánh / Check File Valid or Invalid = /check)",
+        title="🍪 Bảng đăng nhập | Login Panel 🍪",
+        description="📂 Hãy chọn 1 File để đăng nhập / Please choose a File to login!",
         color=get_random_color()
     )
+    embed.add_field(name="Kiểm tra cookies", value=f"/check", inline=True)
+    embed.add_field(name="Check cookies", value=f"/check", inline=True)
+    embed.add_field(name="Độ trễ phản hồi", value=f"{latency} ms", inline=True)
+    embed.set_image(url="https://mir-s3-cdn-cf.behance.net/project_modules/hd/fb762791877129.5e3cb3903fb67.gif")
 
     message = await ctx.followup.send(embed=embed, view=view)
 
@@ -608,28 +629,27 @@ async def login(ctx, type: discord.Option(str, description="Net của bạn là 
     if not select.values:
         await message.delete()
 
-@bot.slash_command(name="steam", description="Lấy tài khoản Steam ngẫu nhiên miễn phí !???")
+@bot.slash_command(name="steam", description="Lấy tài khoản Steam ngẫu nhiên miễn phí / Get Free Steam Accs ?")
 async def steam(ctx):
     await ctx.defer()
 
     if ctx.guild.id != required_server_id:
-        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Máy chủ này không được phép sử dụng lệnh này. Hint: Chạy đâu con sâu !???**")
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không có quyền sử dụng lệnh / No Access! Hint: Chạy đâu con sâu? / Wrong Discord Server!**")
         return
 
     role = discord.utils.get(ctx.author.roles, id=steam_role)
 
     if not role:
-        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Bạn chưa có quyền để sử dụng lệnh này! Hint: Đúng máy chủ nhưng chưa Pick Role!**")
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không có quyền sử dụng / No Access! Hint: Chưa Pick Role / Steam-ers Role not found!**")
         return
 
     user_id = ctx.author.id
     current_time = time.time()
 
-    if user_id in last_steam_usage and (current_time - last_steam_usage[user_id]) < 86400:
-        time_remaining = 86400 - (current_time - last_steam_usage[user_id])
-        hours_remaining = int(time_remaining // 3600)
-        minutes_remaining = int((time_remaining % 3600) // 60)
-        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Bạn đã đạt giới hạn lượt dùng! Vui lòng thử lại sau: `{hours_remaining} giờ {minutes_remaining} phút`!**")
+    if user_id in last_steam_usage and (current_time - last_steam_usage[user_id]) < 172800:
+        time_remaining = 172800 - (current_time - last_steam_usage[user_id])
+        future_time = current_time + time_remaining
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Bạn đã đạt giới hạn / Rate Limited! Thử lại sau / Try again after: <t:{int(future_time)}:R>!**")
         return
 
     try:
@@ -637,22 +657,22 @@ async def steam(ctx):
             lines = file.readlines()
             if lines:
                 selected_line = random.choice(lines).strip()
-                await ctx.author.send(f"**# <a:remdance:1149986502001045504> Tài khoản Steam của bạn là:** `{selected_line}`")
-                await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi tài khoản Steam thành công! Xin hãy kiểm tra hộp thư đến của Discord!**")
+                await ctx.author.send(f"**## <a:remdance:1149986502001045504> Tài khoản Steam của bạn là / Here is your Steam Acc:** `{selected_line}`")
+                await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi tài khoản Steam thành công! Steam sent successfully!**")
                 last_steam_usage[user_id] = current_time
             else:
-                await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không tìm thấy tài khoản Steam nào trong máy chủ!**")
+                await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không tìm thấy tài khoản Steam nào trong máy chủ! / Steam database not found!**")
     
     except Exception as e:
-        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi lấy tài khoản Steam:** {str(e)}")
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi lấy tài khoản Steam / Error:** {str(e)}")
 
-@bot.slash_command(name="check", description="Kiểm tra Netflix hiện có !???")
+@bot.slash_command(name="check", description="Kiểm tra Netflix hiện có / Check vaild or invaild Cookies !???")
 async def check(ctx):
     await ctx.defer()
 
     files = os.listdir('con_netflix')
     if not files:
-        await ctx.followup.send("Không có bánh nào ở đây cả!")
+        await ctx.followup.send("Không có bánh nào ở đây cả / Cookies not found!")
         return
     
     timestamp = int(time.time())
@@ -665,18 +685,73 @@ async def check(ctx):
             valid = check_cookie_validity(cookie_path)
             results.append(f"**└> {cookie_file}** {'**-> ✅**' if valid else '**-> ❌**'}")
         except Exception as e:
-            results.append(f"**└> {cookie_file}** **❌ Lỗi kiểm tra!**")
+            results.append(f"**└> {cookie_file}** **❌ Lỗi kiểm tra / Error!**")
 
     embed = discord.Embed(
-        title="🍪 Công cụ kiểm tra Netflix bởi Draken 🍪",
+        title="🍪 Công cụ kiểm tra Netflix bởi Draken / Checker by Draken 🍪",
         description="**🕘 Kết quả - Result:**",
         color=get_random_color(),
         timestamp=embed_timestamp
     )
     for result in results:
-        embed.add_field(name="📁 Tệp kiểm tra:", value=result, inline=True)
+        embed.add_field(name="📁 Tệp / File:", value=result, inline=True)
+        embed.set_image(url="https://mir-s3-cdn-cf.behance.net/project_modules/hd/fb762791877129.5e3cb3903fb67.gif")
 
     await ctx.followup.send(embed=embed)
+
+@bot.slash_command(description="Tải nội dung từ Yandex Disk và gửi vào chủ đề Discord ?")
+async def yandex(ctx, discord_thread_id: discord.Option(str, description="Nhập ID chủ đề Discord vào đây!"), yandex_link: discord.Option(str, description="Nhập link chia sẻ từ Yandex Disk vào đây!")):
+    await ctx.defer()
+    server_id = ctx.guild.id
+
+    try:
+        await ctx.send_followup(f"**<a:sip:1149986505964662815> Bắt đầu tải dữ liệu từ `{yandex_link}` vào chủ đề <#{discord_thread_id}>**")
+        thread = bot.get_channel(int(discord_thread_id))
+        if thread is None:
+            await ctx.send_followup(f'**<a:zerotwo:1149986532678189097> Không thể tìm thấy chủ đề với ID: `{discord_thread_id}` trên Discord!**')
+            return
+
+        yandex_id = urllib.parse.quote_plus(yandex_link)
+        temp_dir = f'./yandex_{yandex_id}'
+        os.makedirs(temp_dir, exist_ok=True)
+
+        url = f"https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key={yandex_link}"
+        response = requests.get(url)
+        download_url = response.json()["href"]
+        
+        zip_path = os.path.join(temp_dir, 'download.zip')
+        download_file_with_retry(download_url, zip_path)
+
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+
+        for root, dirs, files in os.walk(temp_dir):
+            for file in files:
+                if file == 'download.zip':
+                    continue
+                file_path = os.path.join(root, file)
+                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
+                    if os.path.getsize(file_path) > 50 * 1024 * 1024:
+                        if server_id == required_server_id:
+                            parts = split_video_1(file_path)
+                        else:
+                            parts = split_video(file_path)
+                        for part in parts:
+                            await send_file_to_discord(part, thread)
+                            os.remove(part)
+                    else:
+                        await send_file_to_discord(file_path, thread)
+                else:
+                    await send_file_to_discord(file_path, thread)
+
+        await ctx.send_followup(f"**<a:emoji_anime:1149986363802918922> Đã thực thi xong câu lệnh! Xin hãy kiểm tra tại: <#{discord_thread_id}>!**")
+
+    except Exception as e:
+        print(f"Đã xảy ra lỗi ngoài ý muốn: {e}")
+        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn, vui lòng kiểm tra tại máy chủ!**")
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
 
 @bot.event
 async def on_ready():
