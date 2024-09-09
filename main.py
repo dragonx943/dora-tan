@@ -1,14 +1,22 @@
 import asyncio
+import re
 import os
 import shutil
 import logging
-from telethon import TelegramClient, functions, types
-from telethon.errors import TimeoutError, InviteHashExpiredError, ChannelPrivateError, ChatAdminRequiredError, InviteHashInvalidError
-from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterDocument, InputMessagesFilterVideo
-from telethon.tl.functions.messages import ImportChatInviteRequest, GetHistoryRequest, DeleteMessagesRequest, DeleteChatUserRequest, SendMessageRequest
+import aiohttp
+import subprocess
+from pathlib import Path
+from hydrogram import Client, filters
+from hydrogram.types import Message
+from telethon.errors import FloodWaitError
+from hydrogram.errors import UserAlreadyParticipant, InviteHashExpired, InviteHashInvalid, UsernameInvalid, UsernameNotOccupied, FloodWait
 import discord
+from discord import File
+from discord import Embed
+from discord import Attachment
 from discord.ext import commands
 from discord.ui import Select, View
+from moviepy.editor import VideoFileClip
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from selenium import webdriver
@@ -23,7 +31,12 @@ import pytz
 import urllib.parse
 import zipfile
 import io
+import json
+import yt_dlp
 import requests
+import win32file
+from tqdm import tqdm
+from unidecode import unidecode
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
@@ -35,7 +48,8 @@ required_server_id =
 required_role_id = 
 api_id = 
 api_hash = ''
-telegram_client = TelegramClient('', api_id, api_hash)
+phone_number = ''
+telegram_client = Client("", api_id=api_id, api_hash=api_hash, phone_number=phone_number)
 
 discord_token = ''
 
@@ -56,22 +70,99 @@ logger.addHandler(handler)
 async def send_file_to_discord(file_path, thread):
     await thread.send(file=discord.File(file_path))
 
+def get_long_path_name(path):
+    try:
+        return win32file.GetLongPathName(path)
+    except:
+        return path
+
+def safe_path(path):
+    parts = path.split(os.path.sep)
+    safe_parts = []
+    for part in parts:
+        safe = unidecode(''.join(c if c.isalnum() or c in ['-', '_', '.', ' ', ':'] else '_' for c in part)).strip()
+        safe_parts.append(safe)
+    return os.path.sep.join(safe_parts)
+
+def normalize_path(path):
+    return str(Path(path).resolve())
+
+def list_files_recursively(directory):
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            yield normalize_path(os.path.join(root, file))
+
+def list_all_files(directory):
+    all_files = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            all_files.append(os.path.join(root, file))
+    return all_files
+
+def safe_extract(zip_ref, temp_dir):
+    for file in zip_ref.namelist():
+        try:
+            safe_path_name = safe_path(file.rstrip())
+            safe_full_path = os.path.normpath(os.path.join(temp_dir, safe_path_name))
+            
+            os.makedirs(os.path.dirname(safe_full_path), exist_ok=True)
+            
+            if not file.endswith('/'):
+                source = zip_ref.open(file)
+                target = open(safe_full_path, "wb")
+                with source, target:
+                    shutil.copyfileobj(source, target)
+            
+            print(f"Đã giải nén: {safe_full_path}")
+        except Exception as e:
+            print(f"Lỗi khi giải nén {file}: {str(e)}")
+    
+    for root, dirs, files in os.walk(temp_dir, topdown=False):
+        for name in files + dirs:
+            original_path = os.path.join(root, name)
+            safe_name = safe_path(name)
+            safe_path_full = os.path.join(root, safe_name)
+            if original_path != safe_path_full:
+                try:
+                    os.rename(original_path, safe_path_full)
+                    print(f"Đã đổi tên: {original_path} -> {safe_path_full}")
+                except Exception as e:
+                    print(f"Lỗi khi đổi tên {original_path}: {str(e)}")
+
 def get_random_color():
     return discord.Color(random.randint(0, 0xFFFFFF))
 
-def download_file_with_retry(url, local_filename):
-    session = requests.Session()
-    retry = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-
-    with session.get(url, stream=True) as r:
-        r.raise_for_status()
-        with open(local_filename, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192): 
-                if chunk:
-                    f.write(chunk)
+async def download_file_with_retry(url, local_filename, max_retries=10000):
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    total_size = int(response.headers.get('content-length', 0))
+                    
+                    with open(local_filename, 'wb') as f, tqdm(
+                        desc=local_filename,
+                        total=total_size,
+                        unit='iB',
+                        unit_scale=True,
+                        unit_divisor=1024,
+                    ) as progress_bar:
+                        chunk_size = 8192
+                        async for chunk in response.content.iter_chunked(chunk_size):
+                            size = f.write(chunk)
+                            progress_bar.update(size)
+            
+            return local_filename
+        except aiohttp.ClientError as e:
+            print(f"Lỗi khi tải file (lần thử {attempt + 1}/{max_retries}): {e}")
+            if attempt + 1 < max_retries:
+                await asyncio.sleep(5)
+            else:
+                raise
+        except Exception as e:
+            print(f"Lỗi khi tải file: {e}. Thử lại lần thứ {attempt + 1}/{max_retries}")
+            if attempt + 1 == max_retries:
+                raise
     return local_filename
 
 def init_driver():
@@ -152,250 +243,390 @@ def convert_cookies_to_json_from_content(file_content):
     return cookies
 
 def split_video(file_path, target_size_mb=40):
-    video = VideoFileClip(file_path)
-    total_duration = video.duration
-
-    total_size_bytes = os.path.getsize(file_path)
-    bitrate = (total_size_bytes * 8) / total_duration
     target_size_bytes = target_size_mb * 1024 * 1024
-    target_duration = (target_size_bytes * 8) / bitrate
+    temp_output_template = f"{file_path}_temp%03d.mp4"
+    final_output_template = f"{file_path}_part%03d.mp4"
 
-    current_start = 0
-    parts = []
+    if not os.access(file_path, os.R_OK):
+        print(f"Không có quyền đọc file: {file_path}")
+        return
+    
+    file_path = os.path.abspath(file_path)
+    
+    ffprobe_cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", file_path
+    ]
+    probe_output = subprocess.check_output(ffprobe_cmd).decode('utf-8')
+    probe_data = json.loads(probe_output)
+    
+    duration = float(probe_data['format']['duration'])
+    
+    segment_duration = 10
+    ffmpeg_cmd = [
+        "ffmpeg", "-i", file_path, "-c", "copy", "-f", "segment", 
+        "-segment_time", str(segment_duration), "-reset_timestamps", "1",
+        "-map", "0", "-max_muxing_queue_size", "1024", temp_output_template
+    ]
+    subprocess.run(ffmpeg_cmd, check=True)
+    
+    temp_parts = sorted([f for f in os.listdir(os.path.dirname(file_path)) if f.startswith(os.path.basename(file_path) + "_temp")])
+    
+    final_parts = []
+    current_size = 0
+    current_parts = []
     part_index = 0
-
-    while current_start < total_duration:
-        current_end = min(total_duration, current_start + target_duration)
-        part_path = f"{file_path}_part{part_index}.mp4"
-
-        try:
-            ffmpeg_extract_subclip(file_path, current_start, current_end, targetname=part_path)
-            parts.append(part_path)
-            print(f"Đang chia thành đoạn thứ {part_index} từ phân cảnh {current_start} đến {current_end}")
-            current_start = current_end
+    
+    for temp_part in temp_parts:
+        temp_part_path = os.path.join(os.path.dirname(file_path), temp_part)
+        temp_part_size = os.path.getsize(temp_part_path)
+        
+        if current_size + temp_part_size > target_size_bytes and current_parts:
+            output_file = f"{file_path}_part{part_index:03d}.mp4"
+            concat_file = "concat.txt"
+            with open(concat_file, "w") as f:
+                for part in current_parts:
+                    f.write(f"file '{part}'\n")
+            
+            ffmpeg_concat_cmd = [
+                "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
+            ]
+            subprocess.run(ffmpeg_concat_cmd, check=True)
+            
+            final_parts.append(output_file)
+            current_size = 0
+            current_parts = []
             part_index += 1
-        except Exception as e:
-            print(f"Đã xảy ra lỗi khi tách file video: {e}")
-            break
-
-    if video.reader:
-        video.reader.close()
-    if video.audio and video.audio.reader:
-        video.audio.reader.close_proc()
-
-    return parts
+            os.remove(concat_file)
+        
+        current_size += temp_part_size
+        current_parts.append(temp_part_path)
+    
+    if current_parts:
+        output_file = f"{file_path}_part{part_index:03d}.mp4"
+        concat_file = "concat.txt"
+        with open(concat_file, "w") as f:
+            for part in current_parts:
+                f.write(f"file '{part}'\n")
+        
+        ffmpeg_concat_cmd = [
+            "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
+        ]
+        subprocess.run(ffmpeg_concat_cmd, check=True)
+        
+        final_parts.append(output_file)
+        os.remove(concat_file)
+    
+    for temp_part in temp_parts:
+        os.remove(os.path.join(os.path.dirname(file_path), temp_part))
+    
+    return final_parts
 
 def split_video_1(file_path, target_size_mb=90):
-    video = VideoFileClip(file_path)
-    total_duration = video.duration
-
-    total_size_bytes = os.path.getsize(file_path)
-    bitrate = (total_size_bytes * 8) / total_duration
     target_size_bytes = target_size_mb * 1024 * 1024
-    target_duration = (target_size_bytes * 8) / bitrate
+    temp_output_template = f"{file_path}_temp%03d.mp4"
+    final_output_template = f"{file_path}_part%03d.mp4"
 
-    current_start = 0
-    parts = []
+    if not os.access(file_path, os.R_OK):
+        print(f"Không có quyền đọc file: {file_path}")
+        return
+    
+    file_path = os.path.abspath(file_path)
+    
+    ffprobe_cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", file_path
+    ]
+    probe_output = subprocess.check_output(ffprobe_cmd).decode('utf-8')
+    probe_data = json.loads(probe_output)
+    
+    duration = float(probe_data['format']['duration'])
+    
+    segment_duration = 10
+    ffmpeg_cmd = [
+        "ffmpeg", "-i", file_path, "-c", "copy", "-f", "segment", 
+        "-segment_time", str(segment_duration), "-reset_timestamps", "1",
+        "-map", "0", "-max_muxing_queue_size", "1024", temp_output_template
+    ]
+    subprocess.run(ffmpeg_cmd, check=True)
+    
+    temp_parts = sorted([f for f in os.listdir(os.path.dirname(file_path)) if f.startswith(os.path.basename(file_path) + "_temp")])
+    
+    final_parts = []
+    current_size = 0
+    current_parts = []
     part_index = 0
-
-    while current_start < total_duration:
-        current_end = min(total_duration, current_start + target_duration)
-        part_path = f"{file_path}_part{part_index}.mp4"
-
-        try:
-            ffmpeg_extract_subclip(file_path, current_start, current_end, targetname=part_path)
-            parts.append(part_path)
-            print(f"Đang chia thành đoạn thứ {part_index} từ phân cảnh {current_start} đến {current_end}")
-            current_start = current_end
+    
+    for temp_part in temp_parts:
+        temp_part_path = os.path.join(os.path.dirname(file_path), temp_part)
+        temp_part_size = os.path.getsize(temp_part_path)
+        
+        if current_size + temp_part_size > target_size_bytes and current_parts:
+            output_file = f"{file_path}_part{part_index:03d}.mp4"
+            concat_file = "concat.txt"
+            with open(concat_file, "w") as f:
+                for part in current_parts:
+                    f.write(f"file '{part}'\n")
+            
+            ffmpeg_concat_cmd = [
+                "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
+            ]
+            subprocess.run(ffmpeg_concat_cmd, check=True)
+            
+            final_parts.append(output_file)
+            current_size = 0
+            current_parts = []
             part_index += 1
-        except Exception as e:
-            print(f"Đã xảy ra lỗi khi tách file video: {e}")
-            break
+            os.remove(concat_file)
+        
+        current_size += temp_part_size
+        current_parts.append(temp_part_path)
+    
+    if current_parts:
+        output_file = f"{file_path}_part{part_index:03d}.mp4"
+        concat_file = "concat.txt"
+        with open(concat_file, "w") as f:
+            for part in current_parts:
+                f.write(f"file '{part}'\n")
+        
+        ffmpeg_concat_cmd = [
+            "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
+        ]
+        subprocess.run(ffmpeg_concat_cmd, check=True)
+        
+        final_parts.append(output_file)
+        os.remove(concat_file)
+    
+    for temp_part in temp_parts:
+        os.remove(os.path.join(os.path.dirname(file_path), temp_part))
+    
+    return final_parts
 
-    if video.reader:
-        video.reader.close()
-    if video.audio and video.audio.reader:
-        video.audio.reader.close_proc()
-
-    return parts
-
-async def download_file(media, filename, retries=100):
+async def download_file(message, filename, retries=10000):
     for attempt in range(retries):
         try:
-            await telegram_client.download_media(media, filename)
+            await message.download(file_name=filename)
             return filename
-        except TimeoutError:
-            print(f"Lỗi TimeOut: Thử lại lần thứ {attempt + 1}/{retries}")
+        except FloodWait as e:
+            print(f"Cần chờ {e.value} giây trước khi thử lại.")
+            await asyncio.sleep(e.value)
+        except Exception as e:
+            print(f"Lỗi khi tải file: {e}. Thử lại lần thứ {attempt + 1}/{retries}")
             if attempt + 1 == retries:
                 raise
             await asyncio.sleep(5)
 
+async def ensure_telegram_login():
+    try:
+        await telegram_client.start()
+        return True
+    except Exception as e:
+        print(f"Lỗi khi đăng nhập Telegram: {e}")
+        return False
+
 async def join_group_or_channel(telegram_channel):
-    async with telegram_client:
-        try:
-            if "t.me/joinchat" in telegram_channel or "t.me/+" in telegram_channel:
-                invite_hash = telegram_channel.split('/')[-1].replace('+', '')
-                try:
-                    updates = await telegram_client(ImportChatInviteRequest(invite_hash))
-                    entity = updates.chats[0] if updates.chats else updates.users[0]
-                    print(f"Đã tham gia vào nhóm/kênh: {telegram_channel}")
-                except InviteHashExpiredError:
-                    print(f"Link mời này đã hết hạn hoặc không hợp lệ: {telegram_channel}")
-                    return None
-                except InviteHashInvalidError:
-                    print(f"Mã lời mời không hợp lệ: {telegram_channel}")
-                    return None
-                except Exception as e:
-                    if 'already a participant' in str(e):
-                        print(f"Người dùng đã tham gia vào nhóm/kênh: {telegram_channel}")
-                        return 'already_a_participant'
-                    print(f"Lỗi khi tham gia vào nhóm/kênh: {e}")
-                    return None
-            else:
-                entity = await telegram_client.get_entity(telegram_channel)
-                if isinstance(entity, types.Channel):
-                    await telegram_client(functions.channels.JoinChannelRequest(channel=entity))
-                    print(f"Đã tham gia vào kênh: {telegram_channel}")
-                elif isinstance(entity, (types.User, types.Chat)):
-                    print(f"Đã tìm thấy người dùng hoặc bot: {telegram_channel}")
-                else:
-                    print(f"Loại thực thể không xác định: {telegram_channel}")
-                    return None
-            return entity
-        except (ChannelPrivateError, ChatAdminRequiredError, ValueError) as e:
-            print(f"Lỗi khi tham gia vào kênh này: {e}")
-            return None
-        except Exception as e:
-            print(f"Lỗi không xác định khi tham gia vào kênh/nhóm: {e}")
-            return None
+    try:
+        if telegram_channel.startswith('@'):
+            telegram_channel = telegram_channel[1:]
+        
+        if "t.me/+" in telegram_channel or "t.me/joinchat" in telegram_channel:
+            invite_link = telegram_channel
+            try:
+                await telegram_client.join_chat(invite_link)
+                print(f"Đã tham gia vào nhóm/kênh: {telegram_channel}")
+            except UserAlreadyParticipant:
+                print(f"Bot đã là thành viên của nhóm/kênh: {telegram_channel}")
+            except InviteHashExpired:
+                print(f"Link mời đã hết hạn: {telegram_channel}")
+                return None
+            except InviteHashInvalid:
+                print(f"Link mời không hợp lệ: {telegram_channel}")
+                return None
+            except FloodWaitError as e:
+                print(f"Cần chờ {e.seconds} giây trước khi thử lại.")
+                await asyncio.sleep(e.seconds)
+                return await join_group_or_channel(telegram_channel)
+        else:
+            try:
+                await telegram_client.join_chat(telegram_channel)
+                print(f"Đã tham gia vào kênh: {telegram_channel}")
+            except UserAlreadyParticipant:
+                print(f"Bot đã là thành viên của kênh: {telegram_channel}")
+            except UsernameInvalid:
+                print(f"Tên người dùng không hợp lệ: {telegram_channel}")
+                return None
+            except UsernameNotOccupied:
+                print(f"Tên người dùng không tồn tại: {telegram_channel}")
+                return None
+            except FloodWait as e:
+                print(f"Cần chờ {e.value} giây trước khi thử lại.")
+                await asyncio.sleep(e.value)
+                return await join_group_or_channel(telegram_channel)
+            except FloodWaitError as e:
+                print(f"Cần chờ {e.seconds} giây trước khi thử lại.")
+                await asyncio.sleep(e.seconds)
+                return await join_group_or_channel(telegram_channel)
+        return True
+    
+    except Exception as e:
+        print(f"Lỗi khi tham gia vào kênh/nhóm: {e}")
+        return None
 
 async def download_and_send_messages(thread, telegram_channel, server_id):
-    entity = await join_group_or_channel(telegram_channel)
-    if entity == 'already_a_participant':
-        await thread.send("**<a:zerotwo:1149986532678189097> Lỗi: Nhóm / Kênh đã được tham gia trước đó, vui lòng dùng `/leave_telegram` để rời nhóm / kênh**")
-        return
-    if not entity:
-        await thread.send("**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi tham gia vào nhóm / kênh Telegram. Xin hãy cung cấp 1 Link lời mời hợp lệ!**")
-        return
+    try:
+        join_result = await join_group_or_channel(telegram_channel)
+        if not join_result:
+            await thread.send(f"**<a:zerotwo:1149986532678189097> Không thể tham gia vào nhóm / kênh Telegram: <{telegram_channel}>!**")
+            return
 
-    invite_id = telegram_channel.split('/')[-1]
-    work_dir = f'./telegram_{invite_id}'
-    os.makedirs(work_dir, exist_ok=True)
+        chat = await telegram_client.get_chat(telegram_channel)
+        invite_id = telegram_channel.split('/')[-1]
+        work_dir = f'./telegram_{invite_id}'
+        os.makedirs(work_dir, exist_ok=True)
 
-    async def process_message(index, message, total_messages):
-        if message.photo:
-            filename = f"{work_dir}/{message.id}.jpg"
-            print(f"Đang tải ảnh: {index} / {total_messages} | Tên tệp: {filename}")
-            await download_file(message.photo, filename)
-            await send_file_to_discord(filename, thread)
-        elif message.video:
-            filename = f"{work_dir}/{message.id}.mp4"
-            print(f"Đang tải video: {index} / {total_messages} | Tên tệp: {filename}")
-            await download_file(message.video, filename)
-            if os.path.getsize(filename) > 50 * 1024 * 1024:
-                if server_id == required_server_id:
-                    parts = split_video_1(filename)
-                else:
-                    parts = split_video(filename)
-                for part in parts:
-                    await send_file_to_discord(part, thread)
-            else:
-                await send_file_to_discord(filename, thread)
-        elif message.document:
-            file_name = None
-            for attribute in message.document.attributes:
-                if isinstance(attribute, types.DocumentAttributeFilename):
-                    file_name = attribute.file_name
-                    break
-            if not file_name:
-                file_name = f"{message.id}"
-            filename = f"{work_dir}/{file_name}"
-            print(f"Đang tải tệp: {file_name}")
-            await download_file(message.document, filename)
-            await send_file_to_discord(filename, thread)
-        else:
-            print(f"Đã bỏ qua tin nhắn: {message.id} (không có nội dung hỗ trợ)")
+        async def process_message(message: Message):
+            try:
+                if message.photo:
+                    file_path = await download_file(message, f"{work_dir}/{message.id}.jpg")
+                    await send_file_to_discord(file_path, thread)
+                elif message.video:
+                    file_path = await download_file(message, f"{work_dir}/{message.id}.mp4")
+                    if os.path.getsize(file_path) > 50 * 1024 * 1024:
+                        if server_id == required_server_id:
+                            parts = split_video_1(file_path)
+                        else:
+                            parts = split_video(file_path)
+                        for part in parts:
+                            await send_file_to_discord(part, thread)
+                    else:
+                        await send_file_to_discord(file_path, thread)
+                elif message.document:
+                    file_path = await download_file(message, f"{work_dir}/{message.document.file_name}")
+                    await send_file_to_discord(file_path, thread)
+            except Exception as e:
+                print(f"Lỗi khi xử lý tin nhắn {message.id}: {str(e)}")
 
-    async with telegram_client:
-        if isinstance(entity, types.User) and entity.bot:
-            print('=== Bắt đầu tải tin nhắn từ bot Telegram! ===')
-            history = await telegram_client(GetHistoryRequest(
-                peer=entity,
-                limit=1000,
-                offset_date=None,
-                offset_id=0,
-                max_id=0,
-                min_id=0,
-                add_offset=0,
-                hash=0
-            ))
-            messages = history.messages
-        else:
-            print('=== Bắt đầu tải nội dung từ Telegram! ===')
-            messages = await telegram_client.get_messages(entity, limit=None)
+        total_messages = await telegram_client.get_chat_history_count(chat.id)
+        processed = 0
 
-        total_messages = len(messages)
-        tasks = [process_message(index, message, total_messages) for index, message in enumerate(messages, start=1)]
-        await asyncio.gather(*tasks)
+        async for message in telegram_client.get_chat_history(chat.id):
+            try:
+                await process_message(message)
+                processed += 1
+                if processed % 10 == 0:
+                    print(f"Logs: Đã xử lý {processed}/{total_messages} tin nhắn!")
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
 
-    shutil.rmtree(work_dir)
-    print(f'Đã xóa thư mục: "{work_dir}"')
+        print(f"**Logs: Đã xử lý xong {processed}/{total_messages} tin nhắn!**")
+
+    except Exception as e:
+        await thread.send(f"**<a:zerotwo:1149986532678189097> Lỗi khi tải tin nhắn: {str(e)}**")
+    finally:
+        if 'work_dir' in locals() and os.path.exists(work_dir):
+            shutil.rmtree(work_dir)
+            print(f'Đã xóa thư mục: "{work_dir}"')
 
 async def leave_group_or_delete_messages(telegram_channel):
-    async with telegram_client:
-        try:
-            entity = await telegram_client.get_entity(telegram_channel)
-            if isinstance(entity, types.Channel):
-                await telegram_client(functions.channels.LeaveChannelRequest(channel=entity))
-                print(f"Đã rời khỏi kênh: {telegram_channel}")
-                return "Đã rời khỏi kênh Telegram thành công!"
-            elif isinstance(entity, types.User):
-                print(f"Đã tìm thấy người dùng hoặc bot: {telegram_channel}")
-                messages = await telegram_client.get_messages(entity, limit=None)
-                message_ids = [msg.id for msg in messages]
-                await telegram_client(DeleteMessagesRequest(id=message_ids))
-                print(f"Đã xóa tất cả tin nhắn từ người dùng hoặc bot: {telegram_channel}")
-                return "Đã xóa tất cả tin nhắn từ người dùng / Bot thành công!"
-            elif isinstance(entity, types.Chat):
-                await telegram_client(DeleteChatUserRequest(chat_id=entity.id, user_id=telegram_client.get_me().id))
-                print(f"Đã rời khỏi nhóm: {telegram_channel}")
-                return "Đã rời khỏi nhóm Telegram thành công!"
+    try:
+        chat = await telegram_client.get_chat(telegram_channel)
+        if hasattr(chat, 'type'):
+            if chat.type in ['supergroup', 'channel']:
+                await telegram_client.leave_chat(chat.id)
+                print(f"Logs: Đã rời khỏi kênh/nhóm Telegram thành công!")
+                return
+            elif chat.type == 'private':
+                async for message in telegram_client.get_chat_history(chat.id):
+                    await message.delete()
+                print(f"Logs: Đã xóa tất cả tin nhắn từ người dùng / Bot thành công!")
+                return
             else:
-                print(f"Loại thực thể không xác định: {telegram_channel}")
-                return "Link Telegram này không xác định!"
-        except (ChannelPrivateError, ChatAdminRequiredError, ValueError) as e:
-            print(f"Lỗi khi rời khỏi kênh/nhóm này hoặc xóa tin nhắn: {e}")
-            return f"Lỗi khi rời khỏi kênh / nhóm Telegram hoặc xóa tin nhắn Telegram: {e}"
+                print(f"**Logs: Không thể xác định loại chat, bỏ qua: {chat.type}!**")
+                return
+        else:
+            print(f"**Logs: Không thể xác định loại chat này, bỏ qua!**")
+            return
+    except Exception as e:
+        print(f"Đã xảy ra lỗi khi rời khỏi kênh/nhóm Telegram hoặc xóa tin nhắn: {str(e)}")
 
 @bot.slash_command(description="Tải nội dung từ Telegram và gửi vào chủ đề Discord ?")
-async def telegram(ctx, discord_thread_id: discord.Option(str, description="Nhập ID chủ đề Discord vào đây!"), telegram_channel: discord.Option(str, description="Nhập Link mời từ Telegram vào đây!")):
+async def telegram(ctx, telegram_channel: discord.Option(str, description="Nhập Link lời mời từ Telegram vào đây!")):
     await ctx.defer()
+    gif_url = "https://raw.githubusercontent.com/dragonx943/listcaidaubuoi/main/lewd.gif"
     server_id = ctx.guild.id
 
     try:
-        await ctx.send_followup(f"**<a:sip:1149986505964662815> Bắt đầu tải dữ liệu từ `{telegram_channel}` vào chủ đề <#{discord_thread_id}>**")
-        thread = bot.get_channel(int(discord_thread_id))
-        if thread is None:
-            await ctx.send_followup(f'**<a:zerotwo:1149986532678189097> Không thể tìm thấy chủ đề với ID: `{discord_thread_id}` trên Discord!**')
+        guild_id = str(ctx.guild.id)
+        with open('forum_channels.txt', 'r') as f:
+            data = json.load(f)
+        
+        if guild_id not in data:
+            await ctx.send_followup("**<a:zerotwo:1149986532678189097> Máy chủ này chưa đặt kênh Forum mặc định. Vui lòng sử dụng lệnh `/set-channel` trước.**")
             return
-        if thread.last_message and thread.last_message.content == "**<a:zerotwo:1149986532678189097> Lỗi: Nhóm / Kênh đã được tham gia trước đó, vui lòng dùng `/leave_telegram` để rời nhóm / kênh**":
-            await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn! Vui lòng kiểm tra lỗi tại: <#{discord_thread_id}>!**")
+        
+        forum_channel_id = data[guild_id]
+        forum_channel = bot.get_channel(forum_channel_id)
+        
+        if not forum_channel:
+            await ctx.send_followup("**<a:zerotwo:1149986532678189097> Không tìm thấy kênh Forum đã đặt trước đó. Vui lòng sử dụng lệnh `/set-channel` để đặt lại.**")
+            return
+        
+        telegram_tag = discord.utils.get(forum_channel.available_tags, name="Telegram")
+        if not telegram_tag:
+            await ctx.send_followup("**<a:zerotwo:1149986532678189097> Không tìm thấy thẻ 'Telegram'. Vui lòng sử dụng lệnh `/set_channel` để tạo thẻ.**")
+            return
+
+        if telegram_channel.startswith('@https://'):
+            telegram_channel = telegram_channel[1:]
+        elif not (telegram_channel.startswith('https://t.me/') or telegram_channel.startswith('@')):
+            await ctx.send_followup("**<a:zerotwo:1149986532678189097> Link Telegram này không hợp lệ. Hãy sử dụng Link mời hợp lệ hoặc tên người dùng bắt đầu bằng '@'.**")
+            return
+        
+        join_result = await join_group_or_channel(telegram_channel)
+        if join_result is None:
+            await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Lỗi: Không thể tham gia vào nhóm/kênh: <{telegram_channel}>**")
+            return
+        elif join_result is True:
+            print(f"Logs: Đã tham gia vào nhóm/kênh: {telegram_channel}!")
         else:
-            await download_and_send_messages(thread, telegram_channel, server_id)
-            await ctx.send_followup(f"**<a:emoji_anime:1149986363802918922> Đã thực thi xong câu lệnh! Xin hãy kiểm tra tại: <#{discord_thread_id}>!**")
+            print(f"Logs: Bot đã là thành viên của nhóm/kênh: {telegram_channel}!")
+
+        latency = round(bot.latency * 1000)
+        lmao_chat = "## Vui lòng chờ để Dora-chan tải nội dung và gửi lên Post này. Trong lúc đó, bạn có thể tham khảo các lệnh khác của Dora-chan ở dưới đây!"
+        content = "# Đây là mẫu tin nhắn trả lời tự động của Dora-chan"
+
+        embed = discord.Embed(
+            title="🔗 Panel của Telegram 🌏",
+            description=lmao_chat,
+            color=get_random_color()
+        )
+
+        embed.add_field(name="Độ trễ / Ping", value=f"{latency} ms", inline=True)
+        embed.add_field(name="Yandex -> Discord", value=f"/yandex", inline=True)
+        embed.add_field(name="Lofi 24/7", value=f"/lofi", inline=True)
+        embed.set_image(url=gif_url)
+
+        thread = await forum_channel.create_thread(
+            name=f"Telegram: {telegram_channel}",
+            content=content,
+            applied_tags=[telegram_tag],
+            embed=embed
+        )
+
+        await ctx.send_followup(f"**<a:sip:1149986505964662815> Bắt đầu tải dữ liệu từ `{telegram_channel}` vào chủ đề {thread.mention}**")
+
+        check_map = await leave_group_or_delete_messages(telegram_channel)
+        print(check_map)
+        await download_and_send_messages(thread, telegram_channel, server_id)
+        await leave_group_or_delete_messages(telegram_channel)
+        
+        await thread.send(f"**<a:zerotwo:1149986532678189097> Beep~Beep~~ Dora-chan đã tải thành công dữ liệu lên bài Post này~!**")
+        await ctx.channel.send(f"**<a:emoji_anime:1149986363802918922> {ctx.author.mention} Dora-chan đã làm việc xong! Xin hãy kiểm tra tại: {thread.mention}!**")
+    
     except Exception as e:
         print(f"Đã xảy ra lỗi ngoài ý muốn: {e}")
-        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn, vui lòng kiểm tra tại máy chủ!**")
-
-@bot.slash_command(description="Rời khỏi kênh / nhóm Telegram hoặc xóa tất cả tin nhắn từ người dùng / Bot Telegram ?")
-async def leave_telegram(ctx, telegram_channel: discord.Option(str, description="Nhập Link từ Telegram vào đây!")):
-    await ctx.defer()
-    try:
-        result = await leave_group_or_delete_messages(telegram_channel)
-        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> {result}**")
-    except Exception as e:
-        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn!**")
-
+        import traceback
+        traceback.print_exc()
+        await ctx.channel.send(f"**<a:zerotwo:1149986532678189097> Này {ctx.author.mention}, đã xảy ra lỗi ngoài ý muốn: {str(e)}**")
+    
 @bot.slash_command(description="Kiểm tra thông tin máy chủ ?")
 async def ping(ctx):
     await ctx.defer()
@@ -455,7 +686,7 @@ async def manager(ctx):
             await interaction.response.send_message("**<a:remdance:1149986502001045504> Hãy kiểm tra tin nhắn riêng tư để tải Cookie lên!**", ephemeral=True)
 
             dm_channel = await interaction.user.create_dm()
-            await dm_channel.send("**<a:remdance:1149986502001045504> Xin hãy tải Cookie lên theo tin nhắn này: **")
+            await dm_channel.send("**<a:remdance:1149986502001045504> Xin hãy tải Cookie lên theo tin nhắn này!**")
 
             def check(m):
                 return m.author == interaction.user and m.attachments
@@ -506,7 +737,6 @@ async def manager(ctx):
                 chosen_file = delete_select.values[0]
                 json_file = chosen_file.replace('.txt', '.json')
 
-                # Delete the files
                 os.remove(os.path.join('uncon_netflix', chosen_file))
                 os.remove(os.path.join('con_netflix', json_file))
 
@@ -620,7 +850,7 @@ async def login(ctx, type: discord.Option(str, description="Net của bạn là 
     )
     embed.add_field(name="Kiểm tra cookies", value=f"/check", inline=True)
     embed.add_field(name="Check cookies", value=f"/check", inline=True)
-    embed.add_field(name="Độ trễ phản hồi", value=f"{latency} ms", inline=True)
+    embed.add_field(name="Độ trễ phản hồi / Ping", value=f"{latency} ms", inline=True)
     embed.set_image(url="https://mir-s3-cdn-cf.behance.net/project_modules/hd/fb762791877129.5e3cb3903fb67.gif")
 
     message = await ctx.followup.send(embed=embed, view=view)
@@ -646,8 +876,8 @@ async def steam(ctx):
     user_id = ctx.author.id
     current_time = time.time()
 
-    if user_id in last_steam_usage and (current_time - last_steam_usage[user_id]) < 172800:
-        time_remaining = 172800 - (current_time - last_steam_usage[user_id])
+    if user_id in last_steam_usage and (current_time - last_steam_usage[user_id]) < 86400:
+        time_remaining = 86400 - (current_time - last_steam_usage[user_id])
         future_time = current_time + time_remaining
         await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Bạn đã đạt giới hạn / Rate Limited! Thử lại sau / Try again after: <t:{int(future_time)}:R>!**")
         return
@@ -700,58 +930,199 @@ async def check(ctx):
     await ctx.followup.send(embed=embed)
 
 @bot.slash_command(description="Tải nội dung từ Yandex Disk và gửi vào chủ đề Discord ?")
-async def yandex(ctx, discord_thread_id: discord.Option(str, description="Nhập ID chủ đề Discord vào đây!"), yandex_link: discord.Option(str, description="Nhập link chia sẻ từ Yandex Disk vào đây!")):
+async def yandex(ctx, yandex_link: discord.Option(str, description="Nhập link chia sẻ từ Yandex Disk vào đây!")):
     await ctx.defer()
     server_id = ctx.guild.id
+    gif_url = "https://raw.githubusercontent.com/dragonx943/listcaidaubuoi/main/lewd.gif"
+    temp_dir = None
 
     try:
-        await ctx.send_followup(f"**<a:sip:1149986505964662815> Bắt đầu tải dữ liệu từ `{yandex_link}` vào chủ đề <#{discord_thread_id}>**")
-        thread = bot.get_channel(int(discord_thread_id))
-        if thread is None:
-            await ctx.send_followup(f'**<a:zerotwo:1149986532678189097> Không thể tìm thấy chủ đề với ID: `{discord_thread_id}` trên Discord!**')
+        guild_id = str(ctx.guild.id)
+        with open('forum_channels.txt', 'r') as f:
+            data = json.load(f)
+        
+        if guild_id not in data:
+            await ctx.send_followup("**<a:zerotwo:1149986532678189097> Máy chủ này chưa đặt kênh Forum mặc định. Vui lòng sử dụng lệnh `/set-channel` trước.**")
             return
+        
+        forum_channel_id = data[guild_id]
+        forum_channel = bot.get_channel(forum_channel_id)
+        
+        if not forum_channel:
+            await ctx.send_followup("**<a:zerotwo:1149986532678189097> Không tìm thấy kênh Forum đã đặt trước đó. Vui lòng sử dụng lệnh `/set-channel` để đặt lại.**")
+            return
+        
+        yandex_tag = discord.utils.get(forum_channel.available_tags, name="Yandex")
+        if not yandex_tag:
+            await ctx.send_followup("**<a:zerotwo:1149986532678189097> Không tìm thấy thẻ 'Yandex'. Vui lòng sử dụng lệnh `/set_channel` để tạo thẻ.**")
+            return
+        
+        latency = round(bot.latency * 1000)
+        lmao_chat = "## Vui lòng chờ để Dora-chan tải nội dung và gửi lên Post này. Trong khi đó bạn có thể tham khảo các lệnh khác của Dora-chan ở dưới đây!"
+        content = "# Đây là mẫu tin nhắn trả lời tự động của Dora-chan"
+    
+        embed = discord.Embed(
+            title="🔗 Panel của Yandex 🌏",
+            description=lmao_chat,
+            color=get_random_color()
+        )
 
-        yandex_id = urllib.parse.quote_plus(yandex_link)
-        temp_dir = f'./yandex_{yandex_id}'
-        os.makedirs(temp_dir, exist_ok=True)
+        embed.add_field(name="Độ trễ / Ping", value=f"{latency} ms", inline=True)
+        embed.add_field(name="Telegram -> Discord", value=f"/telegram", inline=True)
+        embed.add_field(name="Lofi 24/7", value=f"/lofi", inline=True)
+        embed.set_image(url=gif_url)
+
+        thread = await forum_channel.create_thread(
+            name=f"Yandex: {yandex_link}",
+            content=content,
+            applied_tags=[yandex_tag],
+            embed=embed
+        )
+
+        await ctx.send_followup(f"**<a:sip:1149986505964662815> Bắt đầu tải dữ liệu từ `{yandex_link}` vào chủ đề {thread.mention}**")
 
         url = f"https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key={yandex_link}"
         response = requests.get(url)
         download_url = response.json()["href"]
         
-        zip_path = os.path.join(temp_dir, 'download.zip')
-        download_file_with_retry(download_url, zip_path)
+        yandex_id = urllib.parse.quote_plus(yandex_link)
+        temp_dir = safe_path(os.path.abspath(f'yandex_{yandex_id}'))
+        os.makedirs(temp_dir, exist_ok=True)
+        print(f"Thư mục tạm thời: {temp_dir}")
 
+        zip_path = safe_path(os.path.join(temp_dir, 'download.zip'))
+        print(f"Đường dẫn file zip: {zip_path}")
+        await download_file_with_retry(download_url, zip_path)
+
+        print("Bắt đầu giải nén...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
+            safe_extract(zip_ref, temp_dir)
+        print("Giải nén hoàn tất")
 
+        os.remove(zip_path)
+        print("Đã xóa file zip")
+
+        print("**Logs: Chờ 5 giây...**")
+        await asyncio.sleep(5)
+        print("Đã chờ xong")
+
+        print("Liệt kê các file trong thư mục:")
         for root, dirs, files in os.walk(temp_dir):
             for file in files:
-                if file == 'download.zip':
-                    continue
-                file_path = os.path.join(root, file)
-                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
-                    if os.path.getsize(file_path) > 50 * 1024 * 1024:
+                print(os.path.join(root, file))
+
+        all_files = list(Path(temp_dir).rglob('*'))
+        print(f"Tổng số file tìm thấy: {len(all_files)}")
+
+        for file_path in all_files:
+            if file_path.is_file():
+                print(f"Đang xử lý file: {file_path}")
+                if file_path.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv']:
+                    if file_path.stat().st_size > 50 * 1024 * 1024:
                         if server_id == required_server_id:
-                            parts = split_video_1(file_path)
+                            parts = split_video_1(str(file_path))
                         else:
-                            parts = split_video(file_path)
+                            parts = split_video(str(file_path))
                         for part in parts:
                             await send_file_to_discord(part, thread)
                             os.remove(part)
                     else:
-                        await send_file_to_discord(file_path, thread)
+                        await send_file_to_discord(str(file_path), thread)
                 else:
-                    await send_file_to_discord(file_path, thread)
-
-        await ctx.send_followup(f"**<a:emoji_anime:1149986363802918922> Đã thực thi xong câu lệnh! Xin hãy kiểm tra tại: <#{discord_thread_id}>!**")
+                    await send_file_to_discord(str(file_path), thread)
+            else:
+                print(f"Không phải file: {file_path}")
+         
+        await thread.send(f"**<a:zerotwo:1149986532678189097> Beep~Beep~~ Dora-chan đã tải thành công dữ liệu lên bài Post này~!**")
+        await ctx.channel.send(f"**<a:emoji_anime:1149986363802918922> {ctx.author.mention} Dora-chan đã làm việc xong! Xin hãy kiểm tra tại: {thread.mention}!**")
 
     except Exception as e:
         print(f"Đã xảy ra lỗi ngoài ý muốn: {e}")
-        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi ngoài ý muốn, vui lòng kiểm tra tại máy chủ!**")
+        import traceback
+        traceback.print_exc()
+        await ctx.channel.send(f"**<a:zerotwo:1149986532678189097> Hey {ctx.author.mention}, đã có lỗi xảy ra ngoài ý muốn, hãy gọi Dev check Var ngay!**")
     finally:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+
+@bot.slash_command(description="Đặt kênh Forum mặc định cho các lệnh Telegram và Yandex")
+async def set_channel(ctx, channel: discord.Option(discord.ForumChannel, description="Chọn kênh Forum mặc định để tạo Post!")):
+    await ctx.defer()
+    
+    guild_id = str(ctx.guild.id)
+    data = {}
+    
+    try:
+        with open('forum_channels.txt', 'r') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        pass
+    
+    data[guild_id] = channel.id
+    
+    with open('forum_channels.txt', 'w') as f:
+        json.dump(data, f)
+    
+    existing_tags = [tag.name for tag in channel.available_tags]
+    new_tags = channel.available_tags.copy()
+    
+    if "Telegram" not in existing_tags:
+        new_tags.append(discord.ForumTag(name="Telegram", emoji="1️⃣"))
+    
+    if "Yandex" not in existing_tags:
+        new_tags.append(discord.ForumTag(name="Yandex", emoji="2️⃣"))
+    
+    if len(new_tags) > len(channel.available_tags):
+        try:
+            await channel.edit(available_tags=new_tags)
+            await ctx.send_followup(f"**<a:sip:1149986505964662815> Đã đặt kênh Forum mặc định thành {channel.mention} cho máy chủ này và cập nhật các thẻ cần thiết!**")
+        except discord.Forbidden:
+            await ctx.send_followup(f"**<a:sip:1149986505964662815> Đã đặt kênh Forum mặc định thành {channel.mention} cho máy chủ này, nhưng không có quyền cập nhật thẻ. Vui lòng thêm thẻ 'Telegram' và 'Yandex' thủ công.**")
+        except discord.HTTPException as e:
+            await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi cập nhật thẻ: {str(e)}. Vui lòng kiểm tra lại ID emoji.**")
+    else:
+        await ctx.send_followup(f"**<a:sip:1149986505964662815> Đã đặt kênh Forum mặc định thành {channel.mention} cho máy chủ này. Các thẻ cần thiết đã tồn tại.**")
+
+@bot.slash_command(description="Phát nhạc Lofi 24/7 trên 1 kênh Voice")
+async def lofi(ctx, channel: discord.Option(discord.VoiceChannel, description="Chọn kênh Voice để phát nhạc 24/7!", required=False)):
+    await ctx.defer()
+
+    if channel is None:
+        if ctx.author.voice:
+            channel = ctx.author.voice.channel
+        else:
+            await ctx.send_followup("**<a:zerotwo:1149986532678189097> Bạn cần phải ở trong 1 kênh Voice hoặc chỉ định 1 kênh Voice nào đó để Bot tham gia!**")
+            return
+
+    try:
+        voice_client = await channel.connect()
+    except Exception as e:
+        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Lỗi: Không thể kết nối với kênh Voice: {str(e)}**")
+        return
+
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'opus',
+            'preferredquality': '320',
+        }],
+        'prefer_ffmpeg': True,
+        'keepvideo': False,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info("https://www.youtube.com/watch?v=jfKfPfyJRdk", download=False)
+        url = info['url']
+
+    ffmpeg_options = {
+        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+        'options': '-vn -filter:a "volume=0.5"'
+    }
+
+    voice_client.play(discord.FFmpegPCMAudio(url, **ffmpeg_options))
+    await ctx.send_followup(f"**<a:sip:1149986505964662815> Đang phát nhạc Lofi 24/7 tại {channel.mention}, hãy tận hưởng!**")
+    await ctx.send_followup(f"**<a:sip:1149986505964662815> Nguồn nhạc: [lofi hip hop radio 📚 beats to relax/study to](<https://www.youtube.com/watch?v=jfKfPfyJRdk>)**")
 
 @bot.event
 async def on_ready():
@@ -760,5 +1131,7 @@ async def on_ready():
     activity=discord.Activity(type=discord.ActivityType.playing, name="đùa với tình cảm của bạn!", state="Bạn đọc dòng này làm gì? Bạn thích tôi à?")
     await bot.change_presence(status=discord.Status.dnd, activity=activity)
     print(f'Đã đăng nhập với Bot: {bot.user}')
+    await ensure_telegram_login()
 
-bot.run(discord_token)
+if __name__ == "__main__":
+    bot.run(discord_token)
