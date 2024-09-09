@@ -10,3 +10,8 @@ datetime
 pytz
 psutil
 selenium
+yt-dlp
+PyNaCl
+pywin32
+unidecode
+hydrogram
