@@ -1,8 +1,10 @@
-telethon
+pyrogram
 bs4
 requests
 lxml
 asyncio
+discord
+discord.py
 pycord
 py-cord
 moviepy
@@ -14,4 +16,9 @@ yt-dlp
 PyNaCl
 pywin32
 unidecode
-hydrogram
+tgcrypto
+aiohttp
+sseclient
+pytz
+bs4
+tqdm
