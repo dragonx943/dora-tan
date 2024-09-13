@@ -7,7 +7,7 @@
 
 ## Cách cài đặt / sử dụng:
 
-1. Tải và cài python phiên bản 3.8 đổ lên, ffmpeg về máy (nếu là Linux thì bú thêm package build-essential hay gì đó liên quan đến gcc)
+1. Tải và cài [python](https://www.python.org/downloads/) phiên bản 3.8 đổ lên, [ffmpeg](https://www.ffmpeg.org/) về máy (nếu là Linux thì bú thêm package [build-essential](https://askubuntu.com/questions/398489/how-to-install-build-essential) hay gì đó liên quan đến gcc)
 2. Mở cmd / Terminal / Powershell đủ loại lên, gõ:
 
 ```sh
