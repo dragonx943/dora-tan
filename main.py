@@ -6,10 +6,9 @@ import logging
 import aiohttp
 import subprocess
 from pathlib import Path
-from hydrogram import Client, filters
-from hydrogram.types import Message
-from telethon.errors import FloodWaitError
-from hydrogram.errors import UserAlreadyParticipant, InviteHashExpired, InviteHashInvalid, UsernameInvalid, UsernameNotOccupied, FloodWait
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import FloodWait, UserAlreadyParticipant, InviteHashExpired, InviteHashInvalid, UsernameInvalid, UsernameNotOccupied
 import discord
 from discord import File
 from discord import Embed
@@ -20,7 +19,13 @@ from moviepy.editor import VideoFileClip
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from selenium import webdriver
+from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from concurrent.futures import ThreadPoolExecutor
+from sseclient import SSEClient
 import psutil
 import platform
 from datetime import datetime, timedelta
@@ -32,11 +37,12 @@ import urllib.parse
 import zipfile
 import io
 import json
-import yt_dlp
 import requests
 import win32file
 from tqdm import tqdm
+from bs4 import BeautifulSoup
 from unidecode import unidecode
+from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
@@ -46,11 +52,13 @@ BOT_OWNER_ID =
 steam_role= 
 required_server_id = 
 required_role_id = 
-api_id = 
-api_hash = ''
-phone_number = ''
-telegram_client = Client("", api_id=api_id, api_hash=api_hash, phone_number=phone_number)
 
+telegram_accounts = [
+    {"api_id": , "api_hash": '', "phone_number": '+'},
+]
+telegram_clients = []
+user_last_send = {}
+last_check_time = {}
 discord_token = ''
 
 intents = discord.Intents.default()
@@ -104,7 +112,6 @@ def safe_extract(zip_ref, temp_dir):
         try:
             safe_path_name = safe_path(file.rstrip())
             safe_full_path = os.path.normpath(os.path.join(temp_dir, safe_path_name))
-            
             os.makedirs(os.path.dirname(safe_full_path), exist_ok=True)
             
             if not file.endswith('/'):
@@ -131,6 +138,16 @@ def safe_extract(zip_ref, temp_dir):
 
 def get_random_color():
     return discord.Color(random.randint(0, 0xFFFFFF))
+
+with open('data.txt', 'r', encoding='utf-8') as f:
+    word_list = [word.strip().lower() for word in f.readlines()]
+
+game_states = {}
+
+def find_valid_word(last_word, used_words):
+    last_syllable = last_word.split()[-1]
+    valid_words = [word for word in word_list if word.split()[0] == last_syllable and word not in used_words]
+    return random.choice(valid_words) if valid_words else None
 
 async def download_file_with_retry(url, local_filename, max_retries=10000):
     for attempt in range(max_retries):
@@ -170,26 +187,43 @@ def init_driver():
     options.add_argument("--headless")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     driver = webdriver.Firefox(options=options)
     return driver
 
 def check_cookie_validity(cookie_path):
-    with open(cookie_path, 'r') as file:
-        cookies = json.load(file)
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Firefox(options=options)
     
-    session = requests.Session()
-    retry = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-
-    for cookie in cookies:
-        session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'], path=cookie['path'])
-
-    response = session.get("https://www.netflix.com/browse")
-    if "profiles" in response.text:
-        return True
-    return False
+    try:
+        with open(cookie_path, 'r') as file:
+            cookies = json.load(file)
+        
+        driver.get("https://www.netflix.com")
+        for cookie in cookies:
+            driver.add_cookie(cookie)
+        
+        driver.get("https://www.netflix.com/browse")
+        
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "profile-gate-label"))
+            )
+            return cookie_path, True
+        except TimeoutException:
+            try:
+                WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "login-button"))
+                )
+                return cookie_path, False
+            except TimeoutException:
+                return cookie_path, False
+    finally:
+        driver.quit()
 
 def load_cookies(driver, cookie_file):
     with open(cookie_file, "r") as file:
@@ -263,7 +297,7 @@ def split_video(file_path, target_size_mb=40):
     
     segment_duration = 10
     ffmpeg_cmd = [
-        "ffmpeg", "-i", file_path, "-c", "copy", "-f", "segment", 
+        "ffmpeg", "-v", "quiet", "-i", file_path, "-c", "copy", "-f", "segment", 
         "-segment_time", str(segment_duration), "-reset_timestamps", "1",
         "-map", "0", "-max_muxing_queue_size", "1024", temp_output_template
     ]
@@ -288,7 +322,7 @@ def split_video(file_path, target_size_mb=40):
                     f.write(f"file '{part}'\n")
             
             ffmpeg_concat_cmd = [
-                "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
+                "ffmpeg", "-v", "quiet", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
             ]
             subprocess.run(ffmpeg_concat_cmd, check=True)
             
@@ -309,7 +343,7 @@ def split_video(file_path, target_size_mb=40):
                 f.write(f"file '{part}'\n")
         
         ffmpeg_concat_cmd = [
-            "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
+            "ffmpeg", "-v", "quiet", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
         ]
         subprocess.run(ffmpeg_concat_cmd, check=True)
         
@@ -342,7 +376,7 @@ def split_video_1(file_path, target_size_mb=90):
     
     segment_duration = 10
     ffmpeg_cmd = [
-        "ffmpeg", "-i", file_path, "-c", "copy", "-f", "segment", 
+        "ffmpeg", "-v", "quiet", "-i", file_path, "-c", "copy", "-f", "segment", 
         "-segment_time", str(segment_duration), "-reset_timestamps", "1",
         "-map", "0", "-max_muxing_queue_size", "1024", temp_output_template
     ]
@@ -367,7 +401,7 @@ def split_video_1(file_path, target_size_mb=90):
                     f.write(f"file '{part}'\n")
             
             ffmpeg_concat_cmd = [
-                "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
+                "ffmpeg", "-v", "quiet", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
             ]
             subprocess.run(ffmpeg_concat_cmd, check=True)
             
@@ -388,7 +422,7 @@ def split_video_1(file_path, target_size_mb=90):
                 f.write(f"file '{part}'\n")
         
         ffmpeg_concat_cmd = [
-            "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
+            "ffmpeg", "-v", "quiet", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_file
         ]
         subprocess.run(ffmpeg_concat_cmd, check=True)
         
@@ -400,14 +434,38 @@ def split_video_1(file_path, target_size_mb=90):
     
     return final_parts
 
+async def check_all_cookies(cookie_files):
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        loop = asyncio.get_event_loop()
+        tasks = [loop.run_in_executor(executor, check_cookie_validity, f'con_netflix/{file}') for file in cookie_files]
+        results = await asyncio.gather(*tasks)
+    return results
+
+async def initialize_clients():
+    for account in telegram_accounts:
+        client = Client(f"tele_tips_{account['phone_number']}", api_id=account['api_id'], api_hash=account['api_hash'], phone_number=account['phone_number'])
+        await client.start()
+        telegram_clients.append(client)
+    print(f"***** Logs: Đã khởi tạo: {len(telegram_clients)} tài khoản Telegram *****")
+
+async def get_available_client():
+    while True:
+        for client in telegram_clients:
+            try:
+                await client.get_me()
+                return client
+            except FloodWait as e:
+                await asyncio.sleep(e.x)
+        await asyncio.sleep(5)
+
 async def download_file(message, filename, retries=10000):
     for attempt in range(retries):
         try:
             await message.download(file_name=filename)
             return filename
         except FloodWait as e:
-            print(f"Cần chờ {e.value} giây trước khi thử lại.")
-            await asyncio.sleep(e.value)
+            print(f"Cần chờ {e.x} giây trước khi thử lại.")
+            await asyncio.sleep(e.x)
         except Exception as e:
             print(f"Lỗi khi tải file: {e}. Thử lại lần thứ {attempt + 1}/{retries}")
             if attempt + 1 == retries:
@@ -422,7 +480,7 @@ async def ensure_telegram_login():
         print(f"Lỗi khi đăng nhập Telegram: {e}")
         return False
 
-async def join_group_or_channel(telegram_channel):
+async def join_group_or_channel(client, telegram_channel, ctx):
     try:
         if telegram_channel.startswith('@'):
             telegram_channel = telegram_channel[1:]
@@ -430,59 +488,61 @@ async def join_group_or_channel(telegram_channel):
         if "t.me/+" in telegram_channel or "t.me/joinchat" in telegram_channel:
             invite_link = telegram_channel
             try:
-                await telegram_client.join_chat(invite_link)
+                await client.join_chat(invite_link)
                 print(f"Đã tham gia vào nhóm/kênh: {telegram_channel}")
             except UserAlreadyParticipant:
                 print(f"Bot đã là thành viên của nhóm/kênh: {telegram_channel}")
             except InviteHashExpired:
                 print(f"Link mời đã hết hạn: {telegram_channel}")
+                await ctx.send(f"**<a:zerotwo:1149986532678189097> Link mời đã hết hạn: {telegram_channel}**")
                 return None
             except InviteHashInvalid:
                 print(f"Link mời không hợp lệ: {telegram_channel}")
+                await ctx.send(f"**<a:zerotwo:1149986532678189097> Link mời không hợp lệ: {telegram_channel}**")
                 return None
-            except FloodWaitError as e:
-                print(f"Cần chờ {e.seconds} giây trước khi thử lại.")
-                await asyncio.sleep(e.seconds)
-                return await join_group_or_channel(telegram_channel)
+            except FloodWait as e:
+                print(f"FloodWait: Đợi {e.x} giây")
+                await asyncio.sleep(e.x)
+                return await join_group_or_channel(await get_available_client(), telegram_channel, ctx)
         else:
             try:
-                await telegram_client.join_chat(telegram_channel)
+                await client.join_chat(telegram_channel)
                 print(f"Đã tham gia vào kênh: {telegram_channel}")
             except UserAlreadyParticipant:
                 print(f"Bot đã là thành viên của kênh: {telegram_channel}")
             except UsernameInvalid:
                 print(f"Tên người dùng không hợp lệ: {telegram_channel}")
+                await ctx.send(f"**<a:zerotwo:1149986532678189097> Tên người dùng không hợp lệ: {telegram_channel}**")
                 return None
             except UsernameNotOccupied:
                 print(f"Tên người dùng không tồn tại: {telegram_channel}")
+                await ctx.send(f"**<a:zerotwo:1149986532678189097> Tên người dùng không tồn tại: {telegram_channel}**")
                 return None
             except FloodWait as e:
-                print(f"Cần chờ {e.value} giây trước khi thử lại.")
-                await asyncio.sleep(e.value)
-                return await join_group_or_channel(telegram_channel)
-            except FloodWaitError as e:
-                print(f"Cần chờ {e.seconds} giây trước khi thử lại.")
-                await asyncio.sleep(e.seconds)
-                return await join_group_or_channel(telegram_channel)
+                print(f"FloodWait: Đợi {e.x} giây")
+                await asyncio.sleep(e.x)
+                return await join_group_or_channel(await get_available_client(), telegram_channel, ctx)
         return True
     
     except Exception as e:
         print(f"Lỗi khi tham gia vào kênh/nhóm: {e}")
+        await ctx.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi tham gia vào kênh/nhóm: {str(e)}**")
         return None
 
-async def download_and_send_messages(thread, telegram_channel, server_id):
+async def download_and_send_messages(thread, telegram_channel, server_id, ctx):
     try:
-        join_result = await join_group_or_channel(telegram_channel)
+        client = await get_available_client()
+        join_result = await join_group_or_channel(client, telegram_channel, ctx)
         if not join_result:
             await thread.send(f"**<a:zerotwo:1149986532678189097> Không thể tham gia vào nhóm / kênh Telegram: <{telegram_channel}>!**")
             return
 
-        chat = await telegram_client.get_chat(telegram_channel)
+        chat = await client.get_chat(telegram_channel)
         invite_id = telegram_channel.split('/')[-1]
         work_dir = f'./telegram_{invite_id}'
         os.makedirs(work_dir, exist_ok=True)
 
-        async def process_message(message: Message):
+        async def process_message(message):
             try:
                 if message.photo:
                     file_path = await download_file(message, f"{work_dir}/{message.id}.jpg")
@@ -504,17 +564,19 @@ async def download_and_send_messages(thread, telegram_channel, server_id):
             except Exception as e:
                 print(f"Lỗi khi xử lý tin nhắn {message.id}: {str(e)}")
 
-        total_messages = await telegram_client.get_chat_history_count(chat.id)
+        total_messages = await client.get_chat_history_count(chat.id)
         processed = 0
 
-        async for message in telegram_client.get_chat_history(chat.id):
+        async for message in client.get_chat_history(chat.id):
             try:
                 await process_message(message)
                 processed += 1
                 if processed % 10 == 0:
                     print(f"Logs: Đã xử lý {processed}/{total_messages} tin nhắn!")
             except FloodWait as e:
-                await asyncio.sleep(e.value)
+                print(f"FloodWait: Đợi {e.x} giây")
+                await asyncio.sleep(e.x)
+                client = await get_available_client()
 
         print(f"**Logs: Đã xử lý xong {processed}/{total_messages} tin nhắn!**")
 
@@ -527,22 +589,19 @@ async def download_and_send_messages(thread, telegram_channel, server_id):
 
 async def leave_group_or_delete_messages(telegram_channel):
     try:
-        chat = await telegram_client.get_chat(telegram_channel)
-        if hasattr(chat, 'type'):
-            if chat.type in ['supergroup', 'channel']:
-                await telegram_client.leave_chat(chat.id)
-                print(f"Logs: Đã rời khỏi kênh/nhóm Telegram thành công!")
-                return
-            elif chat.type == 'private':
-                async for message in telegram_client.get_chat_history(chat.id):
-                    await message.delete()
-                print(f"Logs: Đã xóa tất cả tin nhắn từ người dùng / Bot thành công!")
-                return
-            else:
-                print(f"**Logs: Không thể xác định loại chat, bỏ qua: {chat.type}!**")
-                return
+        client = await get_available_client()
+        chat = await client.get_chat(telegram_channel)
+        if chat.type in ['supergroup', 'channel']:
+            await client.leave_chat(chat.id)
+            print(f"Logs: Đã rời khỏi kênh/nhóm Telegram thành công!")
+            return
+        elif chat.type == 'private':
+            async for message in client.get_chat_history(chat.id):
+                await message.delete()
+            print(f"Logs: Đã xóa tất cả tin nhắn từ người dùng / Bot thành công!")
+            return
         else:
-            print(f"**Logs: Không thể xác định loại chat này, bỏ qua!**")
+            print(f"**Logs: Không thể xác định loại chat, bỏ qua: {chat.type}!**")
             return
     except Exception as e:
         print(f"Đã xảy ra lỗi khi rời khỏi kênh/nhóm Telegram hoặc xóa tin nhắn: {str(e)}")
@@ -580,7 +639,8 @@ async def telegram(ctx, telegram_channel: discord.Option(str, description="Nhậ
             await ctx.send_followup("**<a:zerotwo:1149986532678189097> Link Telegram này không hợp lệ. Hãy sử dụng Link mời hợp lệ hoặc tên người dùng bắt đầu bằng '@'.**")
             return
         
-        join_result = await join_group_or_channel(telegram_channel)
+        client = await get_available_client()
+        join_result = await join_group_or_channel(client, telegram_channel, ctx)
         if join_result is None:
             await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Lỗi: Không thể tham gia vào nhóm/kênh: <{telegram_channel}>**")
             return
@@ -615,9 +675,9 @@ async def telegram(ctx, telegram_channel: discord.Option(str, description="Nhậ
 
         check_map = await leave_group_or_delete_messages(telegram_channel)
         print(check_map)
-        await download_and_send_messages(thread, telegram_channel, server_id)
+        await download_and_send_messages(thread, telegram_channel, server_id, ctx)
         await leave_group_or_delete_messages(telegram_channel)
-        
+
         await thread.send(f"**<a:zerotwo:1149986532678189097> Beep~Beep~~ Dora-chan đã tải thành công dữ liệu lên bài Post này~!**")
         await ctx.channel.send(f"**<a:emoji_anime:1149986363802918922> {ctx.author.mention} Dora-chan đã làm việc xong! Xin hãy kiểm tra tại: {thread.mention}!**")
     
@@ -686,16 +746,13 @@ async def manager(ctx):
             await interaction.response.send_message("**<a:remdance:1149986502001045504> Hãy kiểm tra tin nhắn riêng tư để tải Cookie lên!**", ephemeral=True)
 
             dm_channel = await interaction.user.create_dm()
-            await dm_channel.send("**<a:remdance:1149986502001045504> Xin hãy tải Cookie lên theo tin nhắn này!**")
+            await dm_channel.send("**<a:remdance:1149986502001045504> Xin hãy tải các file Cookie lên theo tin nhắn này: **")
 
             def check(m):
                 return m.author == interaction.user and m.attachments
 
             msg = await bot.wait_for("message", check=check)
-            file = msg.attachments[0]
-
-            file_content = await file.read()
-            file_content = file_content.decode("utf-8")
+            files = msg.attachments
 
             if not os.path.exists('uncon_netflix'):
                 os.makedirs('uncon_netflix')
@@ -705,16 +762,23 @@ async def manager(ctx):
             existing_files = os.listdir('uncon_netflix')
             file_number = len(existing_files) + 1
 
-            uncon_filename = f'netflix_cookie_{file_number}.txt'
-            with open(os.path.join('uncon_netflix', uncon_filename), 'w') as txtfile:
-                txtfile.write(file_content)
+            for file in files:
+                if file.filename.endswith('.txt'):
+                    file_content = await file.read()
+                    file_content = file_content.decode("utf-8")
 
-            cookies_json = convert_cookies_to_json_from_content(file_content)
-            con_filename = f'netflix_cookie_{file_number}.json'
-            with open(os.path.join('con_netflix', con_filename), 'w') as jsonfile:
-                json.dump(cookies_json, jsonfile, indent=4)
+                    uncon_filename = f'netflix_cookie_{file_number}.txt'
+                    with open(os.path.join('uncon_netflix', uncon_filename), 'w') as txtfile:
+                        txtfile.write(file_content)
 
-            await interaction.followup.send(f"**<a:sip:1149986505964662815> Đã nhập Cookie vào Bot thành cmn công! File imported successfully!**")
+                    cookies_json = convert_cookies_to_json_from_content(file_content)
+                    con_filename = f'netflix_cookie_{file_number}.json'
+                    with open(os.path.join('con_netflix', con_filename), 'w') as jsonfile:
+                        json.dump(cookies_json, jsonfile, indent=4)
+
+                    file_number += 1
+
+            await interaction.followup.send(f"**<a:sip:1149986505964662815> Đã nhập {len(files)} File vào Bot thành cmn công! Files imported successfully!**")
             view.clear_items()
 
         elif select.values[0] == "delete":
@@ -775,8 +839,32 @@ async def send(ctx):
         await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi / E: Chưa có quyền sử dụng lệnh này / No permission to do that! Hint: Chưa Pick Role / Role Not Found!**")
         return
 
-    try:
+    join_date = ctx.author.joined_at
+    if join_date is None:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi / E: Không thể xác định thời gian tham gia server!**")
+        return
+    
+    hanoi_tz = pytz.timezone('Asia/Ho_Chi_Minh')
+    join_date_hanoi = join_date.astimezone(hanoi_tz)
+    
+    now_hanoi = datetime.now(hanoi_tz)
+    
+    days_in_server = (now_hanoi.date() - join_date_hanoi.date()).days
+    if days_in_server < 7:
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Lỗi / E: Cần tham gia Server tối thiểu 7 ngày để sử dụng / Need to join Server for at least 7 days to use this command!**")
+        return
 
+    current_time = time.time()
+    if ctx.author.id in user_last_send:
+        time_since_last_use = current_time - user_last_send[ctx.author.id]
+        if time_since_last_use < 86400:
+            time_remaining = 86400 - time_since_last_use
+            hours, remainder = divmod(int(time_remaining), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Lỗi / E: Đã đến giới hạn. Thử lại sau: `{hours}:{minutes}:{seconds}` | Rate limited, try again after: `{hours}:{minutes}:{seconds}`**")
+            return
+
+    try:
         files = [f for f in os.listdir('uncon_netflix') if f.endswith('.txt')]
         if not files:
             await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi / E: Không có file Cookies nào trong thư mục hếtttttt / Cookies NOT FOUND!**")
@@ -789,7 +877,8 @@ async def send(ctx):
             await ctx.author.send(file=discord.File(txtfile, 'cookie.txt'))
             await ctx.author.send(f"**# <a:remdance:1149986502001045504> Cập nhật lần cuối / Last Update: <t:{last_add_timestamp}:R>**")
 
-        await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi bánh quy thành công, hãy kiểm tra hộp thư đến! Cookies sent successfully, check ur inbox pls!**")
+        await ctx.followup.send("**<a:sip:1149986505964662815> Đã gửi bánh quy thành công, hãy kiểm tra hộp thư đến! Cookies sent successfully, please check ur DM!**")
+        user_last_send[ctx.author.id] = current_time
     
     except Exception as e:
         await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi gửi bánh quy / Error:** {str(e)}")
@@ -883,7 +972,7 @@ async def steam(ctx):
         return
 
     try:
-        with open('steam.txt', 'r') as file:
+        with open('steam.txt', 'r', encoding='utf-8') as file:
             lines = file.readlines()
             if lines:
                 selected_line = random.choice(lines).strip()
@@ -893,39 +982,52 @@ async def steam(ctx):
             else:
                 await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không tìm thấy tài khoản Steam nào trong máy chủ! / Steam database not found!**")
     
+    except UnicodeDecodeError:
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Lỗi: Không thể đọc File Steam. Vui lòng liên hệ Dev để kiểm tra File!**")
     except Exception as e:
         await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Đã xảy ra lỗi khi lấy tài khoản Steam / Error:** {str(e)}")
 
-@bot.slash_command(name="check", description="Kiểm tra Netflix hiện có / Check vaild or invaild Cookies !???")
+@bot.slash_command(name="check", description="Kiểm tra Netflix hiện có / Check valid or invalid Cookies !???")
 async def check(ctx):
     await ctx.defer()
+    
+    user_id = ctx.author.id
+    current_time = time.time()
+    
+    if user_id in last_check_time and current_time - last_check_time[user_id] < 15:
+        remaining_time = int(15 - (current_time - last_check_time[user_id]))
+        await ctx.followup.send(f"**<a:zerotwo:1149986532678189097> Vui lòng đợi {remaining_time} giây trước khi sử dụng lại lệnh này.**")
+        return
+    
+    last_check_time[user_id] = current_time
 
     files = os.listdir('con_netflix')
     if not files:
-        await ctx.followup.send("Không có bánh nào ở đây cả / Cookies not found!")
+        await ctx.followup.send("**<a:zerotwo:1149986532678189097> Không có bánh nào ở đây cả / Cookies not found!**")
         return
     
     timestamp = int(time.time())
     tz = pytz.timezone('Asia/Ho_Chi_Minh')
     embed_timestamp = datetime.utcfromtimestamp(timestamp).replace(tzinfo=pytz.utc).astimezone(tz)
-    results = []
-    for cookie_file in files:
-        cookie_path = f'con_netflix/{cookie_file}'
-        try:
-            valid = check_cookie_validity(cookie_path)
-            results.append(f"**└> {cookie_file}** {'**-> ✅**' if valid else '**-> ❌**'}")
-        except Exception as e:
-            results.append(f"**└> {cookie_file}** **❌ Lỗi kiểm tra / Error!**")
+    
+    results = await check_all_cookies(files)
+    
+    valid_count = sum(1 for _, valid in results if valid)
+    invalid_count = len(results) - valid_count
 
     embed = discord.Embed(
         title="🍪 Công cụ kiểm tra Netflix bởi Draken / Checker by Draken 🍪",
-        description="**🕘 Kết quả - Result:**",
+        description=f"**🕘 Kết quả - Result:**\n\n**✅ - Hoạt động / Valid: {valid_count}**\n**❌ - Không hoạt động / Invalid: {invalid_count}**",
         color=get_random_color(),
         timestamp=embed_timestamp
     )
-    for result in results:
-        embed.add_field(name="📁 Tệp / File:", value=result, inline=True)
-        embed.set_image(url="https://mir-s3-cdn-cf.behance.net/project_modules/hd/fb762791877129.5e3cb3903fb67.gif")
+
+    for cookie_path, valid in results:
+        file_name = os.path.basename(cookie_path)
+        status = "✅" if valid else "❌"
+        embed.add_field(name="📁 Tệp / File:", value=f"**└> {file_name} -> {status}**", inline=False)
+
+    embed.set_image(url="https://mir-s3-cdn-cf.behance.net/project_modules/hd/fb762791877129.5e3cb3903fb67.gif")
 
     await ctx.followup.send(embed=embed)
 
@@ -1002,7 +1104,7 @@ async def yandex(ctx, yandex_link: discord.Option(str, description="Nhập link 
         os.remove(zip_path)
         print("Đã xóa file zip")
 
-        print("**Logs: Chờ 5 giây...**")
+        print("Chờ 5 giây...")
         await asyncio.sleep(5)
         print("Đã chờ xong")
 
@@ -1100,29 +1202,195 @@ async def lofi(ctx, channel: discord.Option(discord.VoiceChannel, description="C
         await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Lỗi: Không thể kết nối với kênh Voice: {str(e)}**")
         return
 
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'opus',
-            'preferredquality': '320',
-        }],
-        'prefer_ffmpeg': True,
-        'keepvideo': False,
+    async def play_lofi():
+        url = "https://stream.zeno.fm/0r0xa792kwzuv"
+        ffmpeg_options = {
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            'options': '-vn -filter:a "volume=0.5"'
+        }
+
+        await ctx.send_followup(f"**<a:sip:1149986505964662815> Đang phát nhạc Lofi 24/7 tại {channel.mention}, hãy tận hưởng!**")
+        song_message = await channel.send("**<a:remdance:1149986502001045504> Đang phát / Now Playing: `Đang tải / Loading...`**")
+
+        update_task = asyncio.create_task(update_song_info(song_message, channel))
+
+        while True:
+            try:
+                if voice_client.is_connected():
+                    voice_client.play(discord.FFmpegPCMAudio(url, **ffmpeg_options), after=lambda e: print('Player error: %s' % e) if e else None)
+                    
+                    while voice_client.is_playing() or voice_client.is_paused():
+                        await asyncio.sleep(1)
+                    
+                    await asyncio.sleep(5)
+                    if voice_client.is_connected():
+                        continue
+                    else:
+                        break
+                else:
+                    break
+            except Exception as e:
+                print(f"Lỗi khi phát nhạc: {e}")
+                await asyncio.sleep(5)
+                if not voice_client.is_connected():
+                    try:
+                        await channel.connect()
+                    except Exception as reconnect_error:
+                        print(f"Không thể kết nối lại: {reconnect_error}")
+                        break
+                continue
+        
+        update_task.cancel()
+            
+    bot.loop.create_task(play_lofi())
+
+async def update_song_info(message, channel):
+    url = "https://api.zeno.fm/mounts/metadata/subscribe/0r0xa792kwzuv"
+    
+    async def process_sse(response):
+        async for line in response.content:
+            if line:
+                decoded_line = line.decode('utf-8').strip()
+                if decoded_line.startswith("data:"):
+                    try:
+                        data = json.loads(decoded_line.split("data:")[1])
+                        stream_title = data.get("streamTitle", "Không có tiêu đề")
+                        new_content = f"**<a:remdance:1149986502001045504> Đang phát / Now Playing: `{stream_title}`**"
+                        if message.content != new_content:
+                            await message.edit(content=new_content)
+                    except json.JSONDecodeError:
+                        print(f"Không thể phân tích JSON: {decoded_line}")
+                    except discord.errors.NotFound:
+                        print("Tin nhắn không tồn tại hoặc đã bị xóa")
+                        return
+                    except Exception as e:
+                        print(f"Lỗi: {e}")
+
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers={'Accept': 'text/event-stream'}) as response:
+                    await process_sse(response)
+        except Exception as e:
+            print(f"Lỗi kết nối: {e}")
+        
+        print("Kết nối bị đóng. Thử kết nối lại sau 10 giây...")
+        await asyncio.sleep(10)
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member == bot.user and after.channel is None:
+        if before.channel:
+            try:
+                await before.channel.connect()
+            except Exception as e:
+                print(f"Không thể kết nối lại: {e}")
+
+@bot.slash_command(name="noitu_start", description="Bắt đầu trò chơi Nối Từ với Bot!")
+async def noitu_start(ctx):
+    await ctx.defer()
+    player = ctx.author
+    
+    if player.id in game_states:
+        await ctx.send_followup("**<a:zerotwo:1149986532678189097> Bạn đang trong một trò chơi. Hãy kết thúc trò chơi hiện tại trước khi bắt đầu trò chơi mới!**")
+        return
+    
+    game_states[player.id] = {
+        'current_word': random.choice(word_list),
+        'used_words': set(),
+        'mistakes': 0,
+        'last_bot_message': None
     }
+    
+    bot_message = await ctx.send_followup(f"**<a:emoji_anime:1149986363802918922> {player.mention}, trò chơi bắt đầu! Từ đầu tiên tôi đố bạn là: `{game_states[player.id]['current_word']}`**\n**--> Hãy nhập một từ bắt đầu bằng: `{game_states[player.id]['current_word'].split()[-1]}`!**")
+    game_states[player.id]['last_bot_message'] = bot_message
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info("https://www.youtube.com/watch?v=jfKfPfyJRdk", download=False)
-        url = info['url']
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    
+    player = message.author
+    if player.id in game_states:
+        game = game_states[player.id]
+        
+        if message.reference and message.reference.message_id == game['last_bot_message'].id:
+            word = message.content.lower()
+            
+            last_bot_syllable = game['current_word'].split()[-1]
+            first_player_syllable = word.split()[0]
+            
+            if first_player_syllable == last_bot_syllable:
+                if word in word_list and word not in game['used_words']:
+                    game['used_words'].add(word)
+                    game['current_word'] = word
+                    
+                    bot_word = find_valid_word(word, game['used_words'])
+                    if bot_word:
+                        game['used_words'].add(bot_word)
+                        game['current_word'] = bot_word
+                        bot_message = await message.channel.send(f"**<a:sip:1149986505964662815> Đây là 1 từ hợp lệ! Bot sẽ đối lại bạn với từ: `{bot_word}`**!")
+                        game['last_bot_message'] = await message.channel.send(f"**<a:emoji_anime:1149986363802918922> Đã đến lượt của bạn. Hãy nhập một từ bắt đầu bằng: `{bot_word.split()[-1]}`!**")
+                    else:
+                        await message.channel.send("**<a:sip:1149986505964662815> Bot không tìm được từ phù hợp. Bạn đã thắng, xin chúc mừng!**")
+                        del game_states[player.id]
+                else:
+                    game['mistakes'] += 1
+                    if game['mistakes'] >= 3:
+                        await message.channel.send(f"**<a:sip:1149986505964662815> Bạn đã sai 3 lần. Bot thắng! Trò chơi kết thúc tại đây!**")
+                        del game_states[player.id]
+                    else:
+                        game['last_bot_message'] = await message.channel.send(f"**<a:zerotwo:1149986532678189097> Từ không hợp lệ hoặc đã được sử dụng. Bạn còn {3 - game['mistakes']} lần thử. Hãy thử lại!**")
+            else:
+                game['mistakes'] += 1
+                if game['mistakes'] >= 3:
+                    await message.channel.send(f"**<a:zerotwo:1149986532678189097> Bạn đã sai 3 lần. Bot thắng! Trò chơi kết thúc tại đây!**")
+                    del game_states[player.id]
+                else:
+                    game['last_bot_message'] = await message.channel.send(f"**<a:zerotwo:1149986532678189097> Từ phải bắt đầu bằng `{last_bot_syllable}`. Bạn còn {3 - game['mistakes']} lần thử. Hãy thử lại!**")
+    
+    await bot.process_commands(message)
 
-    ffmpeg_options = {
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-        'options': '-vn -filter:a "volume=0.5"'
-    }
+@bot.slash_command(name="noitu_commit", description="Đóng góp từ mới vào danh sách từ của trò chơi Nối Từ")
+async def noitu_commit(ctx, word: discord.Option(str, description="Từ bạn muốn thêm vào danh sách")):
+    await ctx.defer()
+    word = word.lower().strip()
+    
+    if not word.replace(' ', '').isalpha():
+        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Từ '{word}' không hợp lệ. Vui lòng chỉ sử dụng các chữ cái!**")
+        return
+    
+    with open('data.txt', 'r', encoding='utf-8') as f:
+        existing_words = set(word.strip().lower() for word in f.readlines())
 
-    voice_client.play(discord.FFmpegPCMAudio(url, **ffmpeg_options))
-    await ctx.send_followup(f"**<a:sip:1149986505964662815> Đang phát nhạc Lofi 24/7 tại {channel.mention}, hãy tận hưởng!**")
-    await ctx.send_followup(f"**<a:sip:1149986505964662815> Nguồn nhạc: [lofi hip hop radio 📚 beats to relax/study to](<https://www.youtube.com/watch?v=jfKfPfyJRdk>)**")
+    if word in existing_words:
+        await ctx.send_followup(f"**<a:zerotwo:1149986532678189097> Bỏ qua: Từ '{word}' đã có trong danh sách!**")
+        return
+    
+    with open('data.txt', 'a', encoding='utf-8') as f:
+        f.write(f"\n{word}")
+    word_list.append(word)
+    
+    await ctx.send_followup(f"**<a:sip:1149986505964662815> Đã thêm từ '{word}' vào danh sách thành công!**")
+    
+@bot.slash_command(name="noitu_end", description="Kết thúc phiên chơi Nối Từ hiện tại")
+async def noitu_end(ctx):
+    await ctx.defer()
+    player = ctx.author
+    if player.id in game_states:
+        del game_states[player.id]
+        await ctx.send_followup("**<a:zerotwo:1149986532678189097> Trò chơi Nối Từ đã kết thúc!**")
+    else:
+        await ctx.send_followup("**<a:zerotwo:1149986532678189097> Bạn không có phiên chơi nối từ nào đang diễn ra!**")
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member == bot.user and after.channel is None:
+        if before.channel:
+            try:
+                await before.channel.connect()
+            except Exception as e:
+                print(f"Không thể kết nối lại: {e}")
 
 @bot.event
 async def on_ready():
@@ -1131,7 +1399,7 @@ async def on_ready():
     activity=discord.Activity(type=discord.ActivityType.playing, name="đùa với tình cảm của bạn!", state="Bạn đọc dòng này làm gì? Bạn thích tôi à?")
     await bot.change_presence(status=discord.Status.dnd, activity=activity)
     print(f'Đã đăng nhập với Bot: {bot.user}')
-    await ensure_telegram_login()
-
+    await initialize_clients()
+    
 if __name__ == "__main__":
     bot.run(discord_token)
